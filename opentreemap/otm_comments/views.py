@@ -7,13 +7,16 @@ from functools import partial
 
 from django.core.paginator import Paginator, EmptyPage
 from django.db import transaction
-from django.core.urlresolvers import reverse
+from django.utils.translation import ugettext as _
 
 from django_tinsel.utils import decorate as do
 from django_tinsel.decorators import json_api_call, render_template
 
+from opentreemap.util import get_ids_from_request
+
 from treemap.decorators import (instance_request, admin_instance_request,
                                 require_http_method)
+from treemap.lib.page_of_items import UrlParams, make_filter_context
 
 from exporter.decorators import queryset_as_exported_csv
 
@@ -21,11 +24,11 @@ from otm_comments.models import (EnhancedThreadedComment,
                                  EnhancedThreadedCommentFlag)
 
 
-def _comments_params(request):
+def _comments_params(params):
     # The default view shows all unarchived comments
-    is_archived = request.GET.get('archived', 'False')
-    is_removed = request.GET.get('removed', 'None')
-    sort = request.GET.get('sort', '-submit_date')
+    is_archived = params.get('archived', 'False')
+    is_removed = params.get('removed', 'None')
+    sort = params.get('sort', '-submit_date')
 
     is_archived = None if is_archived == 'None' else (is_archived == 'True')
     is_removed = None if is_removed == 'None' else (is_removed == 'True')
@@ -33,12 +36,15 @@ def _comments_params(request):
     return (is_archived, is_removed, sort)
 
 
-def _comments(request, instance):
-    (is_archived, is_removed, sort) = _comments_params(request)
+def get_comments(params, instance):
+    (is_archived, is_removed, sort) = _comments_params(params)
 
     # Note: we tried .prefetch_related('content_object')
     # but it gives comment.content_object = None  (Django 1.6)
+
+    types = {t.lower() for t in instance.map_feature_types}
     comments = EnhancedThreadedComment.objects \
+        .filter(content_type__model__in=types) \
         .filter(instance=instance) \
         .extra(select={
             'visible_flag_count': 'SELECT COUNT(*) ' +
@@ -58,11 +64,11 @@ def _comments(request, instance):
 
 
 def comment_moderation(request, instance):
-    (is_archived, is_removed, sort) = _comments_params(request)
+    (is_archived, is_removed, sort) = _comments_params(request.GET)
     page_number = int(request.GET.get('page', '1'))
     page_size = int(request.GET.get('size', '5'))
 
-    comments = _comments(request, instance)
+    comments = get_comments(request.GET, instance)
     paginator = Paginator(comments, page_size)
 
     try:
@@ -71,38 +77,34 @@ def comment_moderation(request, instance):
         # If the page number is out of bounds, return the last page
         paged_comments = paginator.page(paginator.num_pages)
 
-    comments_url = reverse('comment_moderation', args=(instance.url_name,))
+    urlizer = UrlParams('comment_moderation', instance.url_name,
+                        archived=is_archived, sort=sort, removed=is_removed,
+                        page=paged_comments.number)
 
-    params = {'archived': is_archived, 'sort': sort, 'removed': is_removed,
-              'page': paged_comments.number}
+    comments_url_for_pagination = urlizer.url('archived', 'removed', 'sort')
+    comments_url_for_sort = urlizer.url('archived', 'removed')
 
-    def urlize(*keys):
-        return '&'.join(['%s=%s' % (key, params[key]) for key in keys])
+    full_params = urlizer.params('archived', 'removed', 'sort', 'page')
 
-    url = comments_url + '?'
-    comments_url_for_pagination = url + urlize('archived', 'removed', 'sort')
-    comments_url_for_sort = url + urlize('archived', 'removed')
-    comments_url_for_filter = url + urlize('sort')
-
-    full_params = urlize('archived', 'removed', 'sort', 'page')
-
-    comments_filter = 'Active'
-    if is_archived is None and is_removed:
-        comments_filter = 'Hidden'
-    elif is_archived and is_removed is None:
-        comments_filter = 'Archived'
-
-    checked_comments = _get_comment_ids(request)
+    checked_comments = get_ids_from_request(request)
     if len(checked_comments) == 1:
         # Don't check the box for non-batch requests
         checked_comments = []
 
+    filter_value = dict(archived=is_archived, removed=is_removed)
+
+    filter_context = make_filter_context(urlizer, filter_value, [
+        (_('Active'), _('active'), dict(archived=False, removed=None)),
+        (_('Hidden'), _('hidden'), dict(archived=None, removed=True)),
+        (_('Archived'), _('archived'), dict(archived=True, removed=None)),
+    ])
+    filter_context['container_attr'] = 'data-comments-filter'
+
     return {
         'comments': paged_comments,
-        'comments_filter': comments_filter,
+        'comments_filter': filter_context,
         'comments_url_for_pagination': comments_url_for_pagination,
         'comments_url_for_sort': comments_url_for_sort,
-        'comments_url_for_filter': comments_url_for_filter,
         'comments_params': full_params,
         'comments_sort': sort,
         'comment_ids': checked_comments
@@ -110,7 +112,7 @@ def comment_moderation(request, instance):
 
 
 def comments_csv(request, instance):
-    comments = _comments(request, instance)
+    comments = get_comments(request.GET, instance)
     return comments.values(
         'id',
         'user__username',
@@ -120,14 +122,6 @@ def comments_csv(request, instance):
         'visible_flag_count',
         'submit_date'
     )
-
-
-def _get_comment_ids(request):
-    comment_ids_string = request.POST.get('comment-ids', None)
-    if comment_ids_string:
-        return [int(id) for id in comment_ids_string.split(',')]
-    else:
-        return []
 
 
 @transaction.atomic
@@ -157,7 +151,7 @@ def unflag(request, instance, comment_id):
 
 @transaction.atomic
 def hide_flags(request, instance):
-    comment_ids = _get_comment_ids(request)
+    comment_ids = get_ids_from_request(request)
     EnhancedThreadedCommentFlag.objects.filter(comment__id__in=comment_ids,
                                                comment__instance=instance)\
         .update(hidden=True)
@@ -165,7 +159,7 @@ def hide_flags(request, instance):
 
 
 def _set_prop_on_comments(request, instance, prop_name, prop_value):
-    comment_ids = _get_comment_ids(request)
+    comment_ids = get_ids_from_request(request)
     comments = EnhancedThreadedComment.objects.filter(
         pk__in=comment_ids, instance=instance)
 

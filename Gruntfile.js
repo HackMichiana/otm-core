@@ -24,7 +24,8 @@ module.exports = function(grunt) {
     grunt.registerTask('check', ['jshint']);
     grunt.registerTask('js', debug ? ['browserify', 'file-creator'] : ['browserify', 'uglify']);
     grunt.registerTask('css', debug ? ['sass', 'concat'] : ['sass', 'concat', 'cssmin']);
-    grunt.registerTask('default', ['js', 'css']);
+    grunt.registerTask('build', ['js', 'css']);
+    grunt.registerTask('default', ['build', 'shell:collect_static']);
 
     /*
      * Maps all src/*.js files by their Django app name.
@@ -90,23 +91,16 @@ module.exports = function(grunt) {
         watch: {
             js: {
                 files: getAliasFiles(getRegularAliases()),
-                tasks: noLint ? ['shell:collect_static'] : ['check', 'shell:collect_static']
+                tasks: ['js', 'shell:collect_static']
             },
             css: {
                 files: 'treemap/css/sass/**/*.scss',
-                tasks: ['shell:collect_static']
-            },
-            lint: {
-                files: [].concat(
-                    getAliasFiles(getSrcAliases()),
-                    getAliasFiles(getTestAliases())
-                ),
-                tasks: ['check']
+                tasks: ['css', 'shell:collect_static']
             }
         },
         shell: {
             collect_static: {
-                command: 'fab vagrant static' + (debug ? ':dev_mode=True' : '')
+                command: 'python manage.py collectstatic --noinput -c'
             }
         },
         browserify: {
@@ -196,6 +190,11 @@ module.exports = function(grunt) {
                             exports: null,
                             depends: { jquery: 'jQuery', bootstrap: 'bootstrap' }
                         },
+                        "bootstrap-multiselect": {
+                            path: './treemap/js/shim/bootstrap-multiselect.js',
+                            exports: null,
+                            depends: { jquery: 'jQuery', bootstrap: 'bootstrap' }
+                        },
                         "bootstrap-slider": {
                             path: './treemap/js/shim/bootstrap-slider.js',
                             exports: null,
@@ -205,10 +204,6 @@ module.exports = function(grunt) {
                         jscolor: {
                             path: './treemap/js/shim/jscolor.js',
                             exports: null
-                        },
-                        history: {
-                            path: './treemap/js/shim/native.history.js',
-                            exports: 'History'
                         }
                     },
                     debug: debug
@@ -251,10 +246,12 @@ module.exports = function(grunt) {
                       'treemap/css/vendor/bootstrap-lightbox.css',
                       'treemap/css/vendor/bootstrap-slider.css',
                       'treemap/css/vendor/datepicker.css',
+                      'treemap/css/vendor/bootstrap-multiselect.css',
                       'treemap/css/vendor/fontello.css',
                       'treemap/css/vendor/toastr.css',
                       'treemap/css/vendor/leaflet.css',
-                      'treemap/css/vendor/leaflet.draw.css'],
+                      'treemap/css/vendor/leaflet.draw.css',
+                      'treemap/css/vendor/dragula.css'],
                 dest: 'treemap/static/css/vendor.css'
             }
         },

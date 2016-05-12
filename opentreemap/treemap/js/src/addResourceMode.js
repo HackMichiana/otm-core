@@ -4,9 +4,8 @@ var $ = require('jquery'),
     _ = require('lodash'),
     L = require('leaflet'),
     U = require('treemap/utility'),
-    addMapFeature = require('treemap/addMapFeature');
-
-require('leafletEditablePolyline');
+    addMapFeature = require('treemap/addMapFeature'),
+    polylineEditor = require('treemap/polylineEditor');
 
 var activateMode = _.identity,
     deactivateMode = _.identity,
@@ -26,10 +25,12 @@ function init(options) {
         $form = U.$find(options.formSelector, $sidebar),
         $summaryHead = U.$find('.summaryHead', $sidebar),
         $summarySubhead = U.$find('.summarySubhead', $sidebar),
+        $continueLink = $('#addresource-viewdetails'),
         mapManager = options.mapManager,
         plotMarker = options.plotMarker,
         areaFieldIdentifier,
-        areaPolygon;
+        editor = polylineEditor(options),
+        onlyOneResourceType = $resourceType.length === 1;
 
     $resourceType.on('change', onResourceTypeChosen);
 
@@ -43,7 +44,7 @@ function init(options) {
     };
 
     deactivateMode = function () {
-        removeAreaPolygon();
+        editor.removeAreaPolygon();
         manager.deactivate();
     };
 
@@ -52,23 +53,34 @@ function init(options) {
             type = $option.val(),
             typeName = $option.next().text().trim(),
             areaFieldName = $option.data('area-field-name'),
+            skipDetailForm = $option.data('skip-detail-form') == 'True',
+            enableContinueEditing = $option.data('is-editable') == 'True',
             addFeatureUrl = config.instance.url + 'features/' + type + '/';
         if (type) {
             manager.setAddFeatureUrl(addFeatureUrl);
+            manager.stepControls.maxStepNumber = manager.stepControls.initialMaxStepNumber;
             manager.stepControls.enableNext(STEP_CHOOSE_TYPE, true);
             manager.stepControls.enableNext(STEP_OUTLINE_AREA, true);
             manager.stepControls.enableNext(STEP_DETAILS, false);
             $summaryHead.text(typeName);
 
             var hasAreaStep = !!areaFieldName;
-            activateAreaStep(hasAreaStep);
+            activateStep(STEP_OUTLINE_AREA, hasAreaStep);
+            activateStep(STEP_DETAILS, !skipDetailForm);
             if (hasAreaStep) {
                 var objectName = type.slice(0, 1).toLowerCase() + type.slice(1);
                 areaFieldIdentifier = objectName + '.' + areaFieldName;
             } else {
                 areaFieldIdentifier = null;
             }
-            removeAreaPolygon(); // in case user backed up and changed type
+            editor.removeAreaPolygon(); // in case user backed up and changed type
+            if (enableContinueEditing) {
+                $continueLink.removeClass('disabled');
+                $continueLink.prop('disabled', false);
+            } else {
+                $continueLink.addClass('disabled');
+                $continueLink.prop('disabled', true);
+            }
 
             $.ajax({
                 url: config.instance.url + "features/" + type + '/',
@@ -79,15 +91,14 @@ function init(options) {
         }
     }
 
-    function activateAreaStep(hasAreaStep) {
-        var stepCount = manager.stepControls.maxStepNumber + 1;
-        if (!hasAreaStep) {
-            stepCount--;
+    function activateStep(step, shouldActivate) {
+        if (!shouldActivate) {
+            manager.stepControls.maxStepNumber--;
         }
         $footerStepCounts.each(function () {
-            $(this).text(stepCount);
+            $(this).text(manager.stepControls.maxStepNumber + 1);
         });
-        manager.stepControls.activateStep(STEP_OUTLINE_AREA, hasAreaStep);
+        manager.stepControls.activateStep(step, shouldActivate);
     }
 
     function onResourceFormLoaded(html) {
@@ -102,11 +113,15 @@ function init(options) {
     }
 
     function initSteps() {
-        $resourceType.prop('checked', false);
-        manager.stepControls.enableNext(STEP_CHOOSE_TYPE, false);
         plotMarker.hide();
-        removeAreaPolygon();
+        editor.removeAreaPolygon();
         hideSubquestions();
+        if (onlyOneResourceType) {
+            onResourceTypeChosen();
+        } else {
+            $resourceType.prop('checked', false);
+            manager.stepControls.enableNext(STEP_CHOOSE_TYPE, false);
+        }
     }
 
     function hideSubquestions() {
@@ -126,59 +141,12 @@ function init(options) {
         }
 
         if (stepNumber === STEP_OUTLINE_AREA) {
-            enableAreaPolygon();
+            editor.enableAreaPolygon({plotMarker: plotMarker});
         } else {
-            disableAreaPolygon();
+            editor.disableAreaPolygon();
         }
     });
 
-    function initAreaPolygon() {
-        var p1 = plotMarker.getLatLng(),
-            p2 = U.offsetLatLngByMeters(p1, -20, -20),
-            points = [
-                [p1.lat, p1.lng],
-                [p2.lat, p1.lng],
-                [p2.lat, p2.lng],
-                [p1.lat, p2.lng]
-            ],
-            pointIcon = L.icon({
-                iconUrl: config.staticUrl + 'img/polygon-point.png',
-                iconSize: [11, 11],
-                iconAnchor: [6, 6]
-            }),
-            newPointIcon = L.icon({
-                iconUrl: config.staticUrl + 'img/polygon-point-new.png',
-                iconSize: [11, 11],
-                iconAnchor: [6, 6]
-            });
-        areaPolygon = L.Polyline.PolylineEditor(points, {
-            pointIcon: pointIcon,
-            newPointIcon: newPointIcon,
-            pointZIndexOffset: 1000
-        });
-        areaPolygon.addTo(mapManager.map);
-    }
-
-    function removeAreaPolygon() {
-        if (areaPolygon) {
-            disableAreaPolygon();
-            mapManager.map.removeLayer(areaPolygon);
-            areaPolygon = null;
-        }
-    }
-
-    function enableAreaPolygon() {
-        if (!areaPolygon) {
-            initAreaPolygon();
-        }
-        mapManager.map.setEditablePolylinesEnabled(true);
-    }
-
-    function disableAreaPolygon() {
-        if (areaPolygon) {
-            mapManager.map.setEditablePolylinesEnabled(false);
-        }
-    }
 
     function onQuestionAnswered(e) {
         var $radioButton = $(e.target),
@@ -207,12 +175,7 @@ function init(options) {
 
     function onSaveBefore(formData) {
         if (areaFieldIdentifier) {
-            var points = _.map(areaPolygon.getPoints(), function (point) {
-                var latLng = point.getLatLng();
-                return [latLng.lng, latLng.lat];
-            });
-            points.push(points[0]);
-            formData[areaFieldIdentifier] = {polygon: points};
+            formData[areaFieldIdentifier] = {polygon: editor.getPoints()};
         }
     }
 }

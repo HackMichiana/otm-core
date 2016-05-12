@@ -1,9 +1,12 @@
 {% load i18n %}
+{% load l10n %}
 {% load auth_extras %}
 {% load form_extras %}
 
-<form id="details-form" data-location-x="{{ plot.geom.x }}" data-location-y="{{ plot.geom.y }}"
+<form id="details-form" data-location-x="{{ plot.geom.x|unlocalize }}" data-location-y="{{ plot.geom.y|unlocalize }}"
       data-map-feature-type="{% if feature.is_plot %}plot{% else %}resource{% endif %}">
+
+    <div class="alert alert-danger text-danger" data-class="error" data-field="mapFeature.geom"></div>
 
     {% if feature.is_plot %}
     {% if tree %}
@@ -22,7 +25,7 @@
     <input type="hidden" name="plot.address_zip" value="{{ plot.address_zip}}">
 
     {% else %}
-    <label>{{ term.Resource }}</label>
+    <label>{{ term.Resource.singular }}</label>
     <div class="field-view">{{ title }}</div>
     {% endif %}
 

@@ -1,8 +1,8 @@
 ![OTM2 open source logo](https://opentreemap.github.io/images/logo@2x.png)
 
-[![Code Health](https://landscape.io/github/OpenTreeMap/otm-core/master/landscape.png)](https://landscape.io/github/OpenTreeMap/OTM2/master)
-[![Build Status](https://travis-ci.org/OpenTreeMap/otm-core.svg?branch=master)](https://travis-ci.org/OpenTreeMap/OTM2)
-[![Coverage Status](https://coveralls.io/repos/OpenTreeMap/otm-core/badge.png)](https://coveralls.io/r/OpenTreeMap/OTM2)
+[![Code Health](https://landscape.io/github/OpenTreeMap/otm-core/master/landscape.png)](https://landscape.io/github/OpenTreeMap/otm-core/master)
+[![Build Status](https://travis-ci.org/OpenTreeMap/otm-core.svg?branch=master)](https://travis-ci.org/OpenTreeMap/otm-core)
+[![Coverage Status](https://coveralls.io/repos/OpenTreeMap/otm-core/badge.png)](https://coveralls.io/r/OpenTreeMap/otm-core)
 
 #OpenTreeMap 2
 
@@ -11,7 +11,7 @@
 Join the user mailing list and let us know: 
 http://groups.google.com/group/opentreemap-user
 
-Or, try the IRC channel at #opentreemap on freenode.net.
+Or, try our Gitter channel: [![Join the chat at https://gitter.im/OpenTreeMap/otm-core](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/OpenTreeMap/otm-core?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
 ##Installation
 

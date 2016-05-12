@@ -1,15 +1,28 @@
 {% load i18n %}
+{% load l10n %}
 {% load util %}
+{% load humanize %}
 
 {% if photo %}
-<div class="col-md-4" data-total-pages="{{ total_pages }}" data-photo>
-    <a class="thumbnail" href="{{ photo.image.url }}">
-      <img data-id="{{ photo.pk }}" src="{{ photo.thumbnail.url }}">
-    </a>
-    <div class="btn-group">
-        <a class="action btn btn-sm" href="{% url "approve_or_reject_photo" instance_url_name=request.instance.url_name feature_id=photo.map_feature.pk photo_id=photo.pk action="approve" %}">{% trans "Approve" %}</a>
-        <a class="action btn btn-sm" href="{% url "approve_or_reject_photo" instance_url_name=request.instance.url_name feature_id=photo.map_feature.pk photo_id=photo.pk action="reject" %}">{% trans "Reject" %}</a>
-        <a class="btn btn-sm" href="{{ photo|detail_link }}">{% trans "View Detail" %}</a>
-    </div>
-</div>
+<tr class="photo-review-item" data-id="{{ photo.pk|unlocalize }}">
+    {% if not is_archived %}
+    <td>
+      <input data-batch-action-checkbox type="checkbox" />
+    </td>
+    {% endif %}
+    <td>{{ photo.pk }}</td>
+    <td>
+        <a class="thumbnail" href="{{ photo.image.url }}">
+          <img src="{{ photo.thumbnail.url }}">
+        </a>
+    </td>
+    <td data-single-action>
+        {% if not is_archived %}
+        <a class="action" href="{% url "approve_or_reject_photos" instance_url_name=request.instance.url_name action="approve" %}?{{ full_params }}">{% trans "Archive" %}</a> |
+        <a class="action" href="{% url "approve_or_reject_photos" instance_url_name=request.instance.url_name action="reject" %}?{{ full_params }}">{% trans "Delete" %}</a> |
+        {% endif %}
+        <a href="{{ photo|detail_link }}">{% trans "View Detail" %}</a>
+    </td>
+    <td>{{ photo.created_at|naturaltime }}</td>
+</tr>
 {% endif %}

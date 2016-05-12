@@ -4,12 +4,12 @@ from __future__ import unicode_literals
 from __future__ import division
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from django.db.models import Count
 from django.core.exceptions import ValidationError
 from django.contrib.gis.db import models
 from django.utils.translation import ugettext as _
+from django.utils.timezone import now
 
 from treemap.models import User, Instance
 
@@ -32,6 +32,8 @@ class GenericImportEvent(models.Model):
     CANCELED = 8
     VERIFICATION_ERROR = 10
 
+    schema_version = models.IntegerField(null=True, blank=True)
+
     # Original Name of the file
     file_name = models.CharField(max_length=255)
 
@@ -48,14 +50,27 @@ class GenericImportEvent(models.Model):
 
     status = models.IntegerField(default=PENDING_VERIFICATION)
 
+    last_processed_at = models.DateTimeField(null=True, blank=True)
+    is_lost = models.BooleanField(default=False)
+
     # The id of a running verification task.  Used for canceling imports
     task_id = models.CharField(max_length=50, default='', blank=True)
+
+    def save(self, *args, **kwargs):
+        if self.pk is None:
+            # Record current import schema version (defined in subclass)
+            self.schema_version = self.import_schema_version
+        super(GenericImportEvent, self).save(*args, **kwargs)
 
     @property
     def row_count(self):
         return self.rows().count()
 
     def status_summary(self):
+        t = "Unknown Error While %s" if self.is_lost else "%s"
+        return t % self.status_description()
+
+    def status_description(self):
         summaries = {
             self.PENDING_VERIFICATION: "Not Yet Started",
             self.LOADING: "Loading",
@@ -68,9 +83,6 @@ class GenericImportEvent(models.Model):
             self.VERIFICATION_ERROR: "Verification Error",
         }
         return summaries.get(self.status, "Finished")
-
-    def active(self):
-        return self.status != GenericImportEvent.FINISHED_CREATING
 
     def is_loading(self):
         return self.status == self.LOADING
@@ -90,6 +102,7 @@ class GenericImportEvent(models.Model):
 
     def can_export(self):
         return (not self.is_running()
+                and self.has_current_schema_version()
                 and self.status != self.FAILED_FILE_VERIFICATION
                 and self.status != self.VERIFICATION_ERROR)
 
@@ -97,20 +110,18 @@ class GenericImportEvent(models.Model):
         return self.status == self.LOADING or self.status == self.VERIFIYING
 
     def can_add_to_map(self):
-        return (
+        return self.has_current_schema_version() and (
             self.status == self.FINISHED_VERIFICATION or
             self.status == self.FINISHED_CREATING)
 
-    def row_counts_by_status(self):
-        q = self.row_set()\
-                .values('status')\
-                .annotate(Count('status'))
+    def has_current_schema_version(self):
+        return self.schema_version == self.import_schema_version
 
-        return {r['status']: r['status__count'] for r in q}
-
-    def completed_row_count(self):
-        n_left = self.row_counts_by_status().get(GenericImportRow.WAITING, 0)
-        return self.row_set().count() - n_left
+    def completed_row_summary(self):
+        waiting = self.row_set().filter(status=GenericImportRow.WAITING)
+        row_count = self.row_count
+        n_complete = row_count - waiting.count()
+        return '{:,} / {:,}'.format(n_complete, row_count)
 
     def update_status(self):
         """ Update the status field based on current row statuses """
@@ -162,6 +173,9 @@ class GenericImportEvent(models.Model):
     def legal_and_required_fields(self):
         raise Exception('Abstract Method')
 
+    def legal_and_required_fields_title_case(self):
+        raise Exception('Abstract Method')
+
     def validate_field_names(self, input_fields):
         """
         Make sure the imported file has valid columns
@@ -183,6 +197,19 @@ class GenericImportEvent(models.Model):
                 self.append_error(errors.MISSING_FIELD, data=[field])
 
         return is_valid
+
+    def mark_finished_and_save(self):
+        self.task_id = ''
+        self.last_processed_at = None
+        self.save()
+
+    def update_progress_timestamp_and_save(self):
+        self.last_processed_at = now()
+        self.save()
+
+    def has_not_been_processed_recently(self):
+        thirty_ago = now() - timedelta(minutes=30)
+        return self.last_processed_at and self.last_processed_at < thirty_ago
 
 
 class GenericImportRow(models.Model):
@@ -406,10 +433,9 @@ class GenericImportRow(models.Model):
             if value:
                 try:
                     datep = datetime.strptime(value, '%Y-%m-%d')
-                    self.cleaned[self.model_fields.DATE_PLANTED] = datep
+                    self.cleaned[field] = datep
                 except ValueError:
-                    self.append_error(errors.INVALID_DATE,
-                                      self.model_fields.DATE_PLANTED)
+                    self.append_error(errors.INVALID_DATE, field)
                     has_errors = True
 
         return has_errors

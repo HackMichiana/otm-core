@@ -4,6 +4,9 @@ from __future__ import unicode_literals
 from __future__ import division
 
 import itertools
+
+from collections import OrderedDict
+
 from django.contrib.gis.db import models
 from django.db import transaction
 from django.utils.translation import ugettext as _
@@ -24,6 +27,7 @@ class SpeciesImportEvent(GenericImportEvent):
     species information
     """
 
+    import_schema_version = 1  # Update if any column header name changes
     import_type = 'species'
 
     max_diameter_conversion_factor = models.FloatField(default=1.0)
@@ -35,7 +39,13 @@ class SpeciesImportEvent(GenericImportEvent):
     def __init__(self, *args, **kwargs):
         super(SpeciesImportEvent, self).__init__(*args, **kwargs)
         self.all_region_codes = all_itree_region_codes()
-        self.instance_region_codes = self.instance.itree_region_codes()
+
+    @property
+    def instance_region_codes(self):
+        if getattr(self, '_instance_region_codes', None) is None:
+            self._instance_region_codes = [itr.code for itr
+                                           in self.instance.itree_regions()]
+        return self._instance_region_codes
 
     def row_set(self):
         return self.speciesimportrow_set
@@ -43,38 +53,42 @@ class SpeciesImportEvent(GenericImportEvent):
     def __unicode__(self):
         return _('Species Import #%s') % self.pk
 
-    def status_summary(self):
+    def status_description(self):
         if self.status == GenericImportEvent.CREATING:
             return "Creating Species Records"
         else:
-            return super(SpeciesImportEvent, self).status_summary()
+            return super(SpeciesImportEvent, self).status_description()
 
     def legal_and_required_fields(self):
         return (fields.species.ALL,
                 {fields.species.GENUS, fields.species.COMMON_NAME})
 
+    def legal_and_required_fields_title_case(self):
+        legal, required = self.legal_and_required_fields()
+        return fields.title_case(legal), fields.title_case(required)
+
 
 class SpeciesImportRow(GenericImportRow):
 
-    SPECIES_MAP = {
-        'genus': fields.species.GENUS,
-        'species': fields.species.SPECIES,
-        'cultivar': fields.species.CULTIVAR,
-        'other_part_of_name': fields.species.OTHER_PART_OF_NAME,
-        'common_name': fields.species.COMMON_NAME,
-        'is_native': fields.species.IS_NATIVE,
-        'flowering_period': fields.species.FLOWERING_PERIOD,
-        'fruit_or_nut_period': fields.species.FRUIT_OR_NUT_PERIOD,
-        'fall_conspicuous': fields.species.FALL_CONSPICUOUS,
-        'flower_conspicuous': fields.species.FLOWER_CONSPICUOUS,
-        'palatable_human': fields.species.PALATABLE_HUMAN,
-        'has_wildlife_value': fields.species.HAS_WILDLIFE_VALUE,
-        'fact_sheet_url': fields.species.FACT_SHEET_URL,
-        'plant_guide_url': fields.species.PLANT_GUIDE_URL,
-        'max_diameter': fields.species.MAX_DIAMETER,
-        'max_height': fields.species.MAX_HEIGHT,
-        'id': fields.species.ID
-    }
+    SPECIES_MAP = OrderedDict((
+        ('genus', fields.species.GENUS),
+        ('species', fields.species.SPECIES),
+        ('cultivar', fields.species.CULTIVAR),
+        ('other_part_of_name', fields.species.OTHER_PART_OF_NAME),
+        ('common_name', fields.species.COMMON_NAME),
+        ('is_native', fields.species.IS_NATIVE),
+        ('flowering_period', fields.species.FLOWERING_PERIOD),
+        ('fruit_or_nut_period', fields.species.FRUIT_OR_NUT_PERIOD),
+        ('fall_conspicuous', fields.species.FALL_CONSPICUOUS),
+        ('flower_conspicuous', fields.species.FLOWER_CONSPICUOUS),
+        ('palatable_human', fields.species.PALATABLE_HUMAN),
+        ('has_wildlife_value', fields.species.HAS_WILDLIFE_VALUE),
+        ('fact_sheet_url', fields.species.FACT_SHEET_URL),
+        ('plant_guide_url', fields.species.PLANT_GUIDE_URL),
+        ('max_diameter', fields.species.MAX_DIAMETER),
+        ('max_height', fields.species.MAX_HEIGHT),
+        ('id', fields.species.ID)
+    ))
 
     # Species reference
     species = models.ForeignKey(Species, null=True, blank=True)

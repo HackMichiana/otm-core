@@ -302,7 +302,6 @@ class InlineFieldTagTests(OTMTestCase):
 
     def setUp(self):
         self.instance = make_instance()
-        self.instance.config['advanced_search_fields'] = {}
         self.instance.save()
         self.role = Role(name='role', instance=self.instance, rep_thresh=0)
         self.role.save()
@@ -548,7 +547,7 @@ class InlineFieldTagTests(OTMTestCase):
     def test_labelless_sets_label_to_default(self):
         self.assert_plot_length_context_value(
             self.observer, 'field.label',
-            Plot._meta.get_field('length').help_text,
+            Plot._meta.get_field('length').verbose_name,
             self._form_template_labelless_with_request_user_for)
 
     def test_labelless_sets_identifier(self):
@@ -591,7 +590,7 @@ class InlineFieldTagTests(OTMTestCase):
     def test_search_gets_default_label_when_none_given(self):
         self.assert_search_context_value(
             self.observer, 'field.label',
-            unicode(Plot._meta.get_field('length').help_text),
+            unicode(Plot._meta.get_field('length').verbose_name),
             {'identifier': 'Plot.length', 'label': None})
 
     def test_search_fields_get_added_only_for_valid_json_matches(self):
@@ -625,10 +624,7 @@ class PartialTagTest(OTMTestCase):
 
 class DisplayValueTagTest(OTMTestCase):
     def test_display_value_converts_string_plot(self):
-        self.assertEqual('Planting Site', display_name('plot'))
-
-    def test_display_value_passes_string_through(self):
-        self.assertEqual('FooBAR', display_name('FooBAR'))
+        self.assertEqual('Planting Site', display_name('Plot'))
 
     def test_display_value_converts_plot_model(self):
         self.assertEqual('Planting Site', display_name(Plot()))

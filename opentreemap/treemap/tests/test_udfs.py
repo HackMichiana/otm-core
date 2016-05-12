@@ -22,7 +22,7 @@ from treemap.lib.object_caches import role_permissions
 from treemap.lib.udf import udf_create
 
 from treemap.udf import UserDefinedFieldDefinition
-from treemap.models import (Plot, User)
+from treemap.models import Instance, Plot, User
 from treemap.audit import (AuthorizeException, FieldPermission, Role,
                            approve_or_reject_audit_and_apply,
                            approve_or_reject_audits_and_apply)
@@ -546,12 +546,17 @@ class UDFDefTest(OTMTestCase):
             {'type': 'float',
              'description': 'this is a float field'})
 
-    def test_choices_not_empty_or_missing(self):
+    def test_choices_not_missing(self):
         self.assertRaises(
             ValidationError,
             self._create_and_save_with_datatype,
             {'type': 'choice'})
 
+        self._create_and_save_with_datatype(
+            {'type': 'choice',
+             'choices': ['a choice', 'another']})
+
+    def test_choices_not_empty(self):
         self.assertRaises(
             ValidationError,
             self._create_and_save_with_datatype,
@@ -740,6 +745,7 @@ class ScalarUDFTest(OTMTestCase):
 
         addl_fields = ['udf:Test %s' % ttype for ttype in allowed_types]
         addl_fields.append('udf:Test choice')
+        addl_fields.append('udf:Test multichoice')
 
         self.commander_user = make_commander_user(self.instance)
         set_write_permissions(self.instance, self.commander_user,
@@ -755,6 +761,14 @@ class ScalarUDFTest(OTMTestCase):
                                  'choices': ['a', 'b', 'c']}),
             iscollection=False,
             name='Test choice')
+
+        self.multichoice_udfd = UserDefinedFieldDefinition.objects.create(
+            instance=self.instance,
+            model_type='Plot',
+            datatype=json.dumps({'type': 'multichoice',
+                                 'choices': ['a', 'b', 'c']}),
+            iscollection=False,
+            name='Test multichoice')
 
         self.plot = Plot(geom=self.p, instance=self.instance)
         self.plot.save_with_user(self.commander_user)
@@ -829,6 +843,68 @@ class ScalarUDFTest(OTMTestCase):
         self.assertEqual(
             set(choice.datatype_dict['choices']),
             {'b', 'c'})
+
+    def test_delete_multichoice_value(self):
+        self.plot.udfs['Test multichoice'] = ['a']
+        self.plot.save_with_user(self.commander_user)
+
+        self.plot = Plot.objects.get(pk=self.plot.pk)
+        audit = self.plot.audits().get(field='udf:Test multichoice')
+
+        self.assertEqual(
+            self.plot.udfs['Test multichoice'], ['a'])
+        self.assertEqual(
+            json.loads(audit.current_value), ['a'])
+
+        self.multichoice_udfd.delete_choice('a')
+
+        self.plot = Plot.objects.get(pk=self.plot.pk)
+        audit = self.plot.audits().filter(field='udf:Test multichoice')
+
+        self.assertEqual(self.plot.udfs['Test multichoice'], None)
+        self.assertEqual(json.loads(audit[0].current_value), None)
+
+        choice = UserDefinedFieldDefinition.objects.get(
+            pk=self.multichoice_udfd.pk)
+
+        self.assertEqual(
+            set(choice.datatype_dict['choices']),
+            {'b', 'c'})
+
+    def test_update_multichoice_value(self):
+        # setup plot and requery
+        self.plot.udfs['Test multichoice'] = ['a']
+        self.plot.save_with_user(self.commander_user)
+        self.plot = Plot.objects.get(pk=self.plot.pk)
+
+        self.multichoice_udfd.update_choice('a', 'weird \\\\\\1a2chars')
+
+        self.plot = Plot.objects.get(pk=self.plot.pk)
+        audit = self.plot.audits().get(field='udf:Test multichoice')
+
+        self.assertEqual(
+            self.plot.udfs['Test multichoice'], ['weird \\\\\\1a2chars'])
+        self.assertEqual(json.loads(audit.current_value),
+                         ['weird \\\\\\1a2chars'])
+
+        choice = UserDefinedFieldDefinition.objects.get(
+            pk=self.multichoice_udfd.pk)
+
+        self.assertEqual(
+            set(choice.datatype_dict['choices']),
+            {'weird \\\\\\1a2chars', 'b', 'c'})
+
+        self.plot = Plot.objects.get(pk=self.plot.pk)
+        self.multichoice_udfd.update_choice('b', 'd')
+        self.assertEqual(
+            self.plot.udfs['Test multichoice'], ['weird \\\\\\1a2chars'])
+
+        choice = UserDefinedFieldDefinition.objects.get(
+            pk=self.multichoice_udfd.pk)
+
+        self.assertEqual(
+            set(choice.datatype_dict['choices']),
+            {'weird \\\\\\1a2chars', 'd', 'c'})
 
     def test_update_choice_value(self):
         self.plot.udfs['Test choice'] = 'a'
@@ -1082,6 +1158,68 @@ class UdfDeleteTest(OTMTestCase):
         self.assertTrue(qs.exists())
         udf_def.delete()
         self.assertFalse(qs.exists())
+
+    def test_delete_udf_deletes_mobile_api_field(self):
+        udf_def = UserDefinedFieldDefinition(
+            instance=self.instance,
+            model_type='Plot',
+            datatype=json.dumps({'type': 'string'}),
+            iscollection=False,
+            name='Test string')
+        udf_def.save()
+
+        self.instance.mobile_api_fields = [
+            {'header': 'fields', 'model': 'plot',
+             'field_keys': ['plot.udf:Test string']}]
+        self.instance.save()
+
+        udf_def.delete()
+
+        updated_instance = Instance.objects.get(pk=self.instance.pk)
+        self.assertEquals(
+            0, len(updated_instance.mobile_api_fields[0]['field_keys']))
+
+    def test_delete_cudf_deletes_mobile_api_field_group(self):
+        tree_udf_def = UserDefinedFieldDefinition(
+            instance=self.instance,
+            model_type='Plot',
+            datatype=json.dumps([{'name': 'pick',
+                                  'type': 'choice',
+                                  'choices': ['a', 'b', 'c']},
+                                 {'type': 'int',
+                                  'name': 'height'}]),
+            iscollection=True,
+            name='Choices')
+        tree_udf_def.save()
+        plot_udf_def = UserDefinedFieldDefinition(
+            instance=self.instance,
+            model_type='Tree',
+            datatype=json.dumps([{'name': 'pick',
+                                  'type': 'choice',
+                                  'choices': ['1', '2', '3']},
+                                 {'type': 'int',
+                                  'name': 'times'}]),
+            iscollection=True,
+            name='Choices')
+        plot_udf_def.save()
+
+        self.instance.mobile_api_fields = [
+            {'header': 'plot', 'model': 'plot', 'field_keys': ['plot.width']},
+            {'header': 'Choices', 'sort_key': 'pick',
+             'collection_udf_keys': ['plot.udf:Choices', 'tree.udf:Choices']}
+        ]
+        self.instance.save()
+
+        tree_udf_def.delete()
+
+        updated_instance = Instance.objects.get(pk=self.instance.pk)
+        self.assertEquals(1, len(
+            updated_instance.mobile_api_fields[1]['collection_udf_keys']))
+
+        plot_udf_def.delete()
+
+        updated_instance = Instance.objects.get(pk=self.instance.pk)
+        self.assertEquals(1, len(updated_instance.mobile_api_fields))
 
 
 class UdfCRUTestCase(OTMTestCase):

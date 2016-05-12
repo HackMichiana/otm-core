@@ -9,6 +9,7 @@ _test_settings = {
 
     # Without this we'd need to invalidate the cache before every test.
     'USE_OBJECT_CACHES': False,
+    'USE_ECO_CACHE': False,
 }
 
 
@@ -17,4 +18,7 @@ class OTMTestCase(TestCase):
     """
     Base class for OTM2 tests.
     """
-    pass
+    def assertValidationErrorDictContainsKey(self, ve, key):
+        self.assertTrue(key in ve.error_dict,
+                        'Expected "%s" to be a key in error_dict %s' %
+                        (key, ve.error_dict))

@@ -10,13 +10,21 @@ var $ = require('jquery'),
 var DATETIME_FORMAT = exports.DATETIME_FORMAT = "YYYY-MM-DD HH:mm:ss";
 var DATE_FORMAT = exports.DATE_FORMAT = "YYYY-MM-DD";
 
+var multiChoiceDisplayTemplate = _.template('<table><tbody>' +
+                                            '<% _.each(rows, function(row) { ' +
+                                            '%><tr><td><%= row %></td></tr>' +
+                                            '<% }); %>' +
+                                            '</tbody></table>');
+
 var getField = exports.getField = function ($fields, name) {
     return $fields.filter(format('[data-field="%s"]', name));
 };
 var getSerializableField = exports.getSerializableField = function ($fields, name) {
     // takes a jQuery collection of edit fields and returns the
     // actual input or select field that will be serialized
-    return getField($fields, name).find('[name="' + name + '"]');
+    var $subfields = getField($fields, name),
+        selector = '[name="' + name + '"]';
+    return $subfields.find(selector).add($subfields.filter(selector));
 };
 
 var excludeButtons = exports.excludeButtons = function (selector) {
@@ -71,10 +79,17 @@ exports.formToDictionary = function ($form, $editFields, $displayFields) {
     };
 
     var result = {};
+
     _.each($form.serializeArray(), function(item) {
         var type = getField($editFields, item.name).attr('data-type'),
             displayValue = getDisplayValue(type, item.name),
             $field = getSerializableField($editFields, item.name);
+
+        if (type === 'multichoice') {
+            // If n choices are selected the serialized array has n items.
+            // It's simpler to skip them here and process them below.
+            return;
+        }
 
         if (item.value === displayValue) {
             return;  // Don't serialize unchanged values
@@ -99,10 +114,34 @@ exports.formToDictionary = function ($form, $editFields, $displayFields) {
             result[item.name] = item.value;
         }
     });
+
     $form.find('[name][type="checkbox"]').not('[disabled]').each(function(i, elem) {
         if (elem.checked !== getDisplayValue('bool', elem.name)) {
             result[elem.name] = elem.checked;
         }
     });
+
+    $form
+        .find('select[name][multiple]')
+        .each(function(i, elem) {
+            // Compare current multichoice value with display value
+            var name = elem.name,
+                value = $(elem).val() || [],
+                display = getDisplayValue('multichoice', name);
+            display = (display === "null") ? [] : JSON.parse(display);
+            if (! _.isEqual(value.sort(), display.sort())) {
+                // Value of multichoice field has changed
+                result[name] = value;
+            }
+        });
+
     return result;
+};
+
+exports.renderMultiChoices = function($container) {
+    $container.each(function (__, el) {
+        var $el = $(el),
+            value = JSON.parse($(el).attr('data-value'));
+        $(el).html(multiChoiceDisplayTemplate({rows: value}));
+    });
 };

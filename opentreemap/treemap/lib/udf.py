@@ -1,8 +1,6 @@
 import json
 
 from django.db import transaction
-from django.core.exceptions import ValidationError
-from django.utils.translation import ugettext as _
 
 from treemap.audit import Role, FieldPermission
 from treemap.udf import (UserDefinedFieldDefinition)
@@ -23,6 +21,7 @@ def udf_exists(params, instance):
     """
     data = _parse_params(params)
 
+    # TODO: should use caching (udf_defs)
     udfs = UserDefinedFieldDefinition.objects.filter(
         instance=instance,
         model_type=data['model_type'],
@@ -36,24 +35,6 @@ def udf_create(params, instance):
     data = _parse_params(params)
     name, model_type, datatype = (data['name'], data['model_type'],
                                   data['datatype'])
-
-    udfs = UserDefinedFieldDefinition.objects.filter(
-        instance=instance,
-        # TODO: why isn't this also checking model name
-        # is there some reason the same name can't appear
-        # on more than one model?
-        # Too scared to change this.
-        name=name)
-
-    if udfs.exists():
-        raise ValidationError(
-            {'udf.name':
-             [_("A user defined field with name "
-                "'%(udf_name)s' already exists") % {'udf_name': name}]})
-
-    if model_type not in ['Tree', 'Plot']:
-        raise ValidationError(
-            {'udf.model': [_('Invalid model')]})
 
     udf = UserDefinedFieldDefinition(
         name=name,
@@ -85,7 +66,7 @@ def _parse_params(params):
 
     datatype = {'type': udf_type}
 
-    if udf_type == 'choice':
+    if udf_type in ('choice', 'multichoice'):
         datatype['choices'] = params.get('udf.choices', None)
 
     datatype = json.dumps(datatype)

@@ -40,7 +40,7 @@
     }
 }
 
-#plot-form {
+#map-feature-form {
     margin-top: 0;
 
     table {
@@ -72,6 +72,20 @@
             }
         }
     }
+
+    .multiselect.dropdown-toggle {
+        max-width: 270px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        text-align: left;
+        padding-right: 24px;
+
+        > b.caret {
+            position: absolute;
+            right: 12px;
+            top: 15px;
+        }
+    }
 }
 
 .map-small,
@@ -84,10 +98,14 @@
     border-radius: 9px;
 }
 
-// Needed because bootstrap breaks street view on firefox
-// by setting max-width: 100% on all <img> tags
-.street-view-small img {
-    max-width: none;
+.street-view-small {
+    height: 440px;
+
+    // Needed because bootstrap breaks street view on firefox
+    // by setting max-width: 100% on all <img> tags
+    .street-view-small img {
+        max-width: none;
+    }
 }
 
 #sidebar {

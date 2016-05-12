@@ -2,6 +2,7 @@ from __future__ import print_function
 from __future__ import unicode_literals
 from __future__ import division
 
+import json
 import hashlib
 from functools import partial
 from datetime import datetime
@@ -10,7 +11,7 @@ from django.contrib.gis.db import models
 from django.contrib.gis.geos import GEOSGeometry
 
 from django.forms.models import model_to_dict
-from django.utils.translation import ugettext as _
+from django.utils.translation import ugettext_lazy as _
 from django.utils.dateformat import format as dformat
 from django.dispatch import receiver
 from django.db.models import OneToOneField
@@ -21,9 +22,12 @@ from django.db import IntegrityError, connection, transaction
 from django.conf import settings
 
 from treemap.units import (is_convertible, is_convertible_or_formattable,
-                           get_display_value, get_units, get_unit_name)
-from treemap.util import all_subclasses
-from treemap.lib.object_caches import (permissions, role_permissions,
+                           get_display_value, get_units, get_unit_name,
+                           Convertible)
+from treemap.util import (all_models_of_class, leaf_models_of_class,
+                          to_object_name)
+
+from treemap.lib.object_caches import (permissions,
                                        invalidate_adjuncts, udf_defs)
 from treemap.lib.dates import datesafe_eq
 
@@ -51,7 +55,7 @@ def get_id_sequence_name(model_class):
     """
     if isinstance(model_class._meta.pk, OneToOneField):
         # Model uses multi-table inheritance (probably a MapFeature subclass)
-        model_class = model_class._meta.pk.related.parent_model
+        model_class = model_class._meta.get_parent_list()[-1]
 
     table_name = model_class._meta.db_table
     pk_field = model_class._meta.pk
@@ -140,13 +144,16 @@ def approve_or_reject_audits_and_apply(audits, user, approved):
 
 def add_default_permissions(instance, roles=None, models=None):
     # Audit is imported into models, so models can't be imported up top
-    from treemap.models import MapFeature
+    from treemap.models import MapFeaturePhoto
     if roles is None:
         roles = Role.objects.filter(instance=instance)
+
     if models is None:
-        # MapFeature is "Authorizable", but it is effectively abstract
-        # Only it's subclasses should have permissions added
-        models = all_subclasses(Authorizable) - {MapFeature, PendingAuditable}
+        # We need permissions only on those subclasses of Authorizable
+        # which we instantiate. Those are the leaf nodes of the
+        # subclass tree, plus MapFeaturePhoto (which has subclass
+        # TreePhoto).
+        models = leaf_models_of_class(Authorizable) | {MapFeaturePhoto}
 
     for role in roles:
         _add_default_permissions(models, role, instance)
@@ -158,16 +165,12 @@ def _add_default_permissions(models, role, instance):
     Make an entry for every tracked field of given models, as well as UDFs of
     given instance.
     """
-    from udf import UserDefinedFieldDefinition
-
     perms = []
     for Model in models:
         mobj = Model(instance=instance)
 
         model_name = mobj._model_name
-        udfs = [udf.canonical_name for udf in
-                UserDefinedFieldDefinition.objects.filter(
-                    instance=instance, model_type=model_name)]
+        udfs = [udf.canonical_name for udf in udf_defs(instance, model_name)]
 
         model_fields = set(mobj.tracked_fields + udfs)
 
@@ -188,7 +191,14 @@ def _add_default_permissions(models, role, instance):
         perms = [FieldPermission(**perm) for perm in perms]
         for perm in perms:
             perm.permission_level = role.default_permission
+
         FieldPermission.objects.bulk_create(perms)
+        # Because we use bulk_create, we must manually trigger the save signal
+        # invalidate_adjuncts would get passed a FieldPermission object if we
+        # called save directly, but it doesn't use it for anything other than
+        # to get the associated instance, which is the same here for all perms,
+        # so just passing it the first FieldPermission should be fine
+        invalidate_adjuncts(instance=perms[0])
 
 
 def approve_or_reject_existing_edit(audit, user, approved):
@@ -405,6 +415,7 @@ def _verify_user_can_apply_audit(audit, user):
     from udf import UserDefinedFieldDefinition
 
     if audit.model.startswith('udf:'):
+        # TODO: should use caching (udf_defs)
         udf = UserDefinedFieldDefinition.objects.get(pk=audit.model[4:])
         field = 'udf:%s' % udf.name
         model = udf.model_type
@@ -597,19 +608,20 @@ class FieldPermission(models.Model):
     WRITE_WITH_AUDIT = 2
     WRITE_DIRECTLY = 3
     choices = (
-        # reserving zero in case we want
-        # to create a "null-permission" later
-        (NONE, "None"),
-        (READ_ONLY, "Read Only"),
-        (WRITE_WITH_AUDIT, "Write with Audit"),
-        (WRITE_DIRECTLY, "Write Directly"))
+        (NONE, _("Invisible")),
+        (READ_ONLY, _("Read Only")),
+        (WRITE_WITH_AUDIT, _("Pending Write Access")),
+        (WRITE_DIRECTLY, _("Full Write Access")))
     permission_level = models.IntegerField(choices=choices, default=NONE)
 
     class Meta:
         unique_together = ('model_name', 'field_name', 'role', 'instance')
 
     def __unicode__(self):
-        return "%s.%s - %s" % (self.model_name, self.field_name, self.role)
+        return "%s.%s - %s - %s" % (self.model_name,
+                                    self.field_name,
+                                    self.role,
+                                    self.choices[self.permission_level][1])
 
     @property
     def allows_reads(self):
@@ -627,6 +639,10 @@ class FieldPermission(models.Model):
             base_name = self.field_name
 
         return base_name.replace('_', ' ').title()
+
+    @property
+    def full_name(self):
+        return "{}.{}".format(self.model_name, self.field_name)
 
     def clean(self):
         try:
@@ -660,26 +676,14 @@ post_delete.connect(invalidate_adjuncts, sender=FieldPermission)
 
 class Role(models.Model):
     # special role names, used in the app
-    ADMINISTRATOR = 'administrator'
-    EDITOR = 'editor'
-    PUBLIC = 'public'
+    DEFAULT_ROLE_NAMES = ('administrator', 'editor', 'public')
+    ADMINISTRATOR, EDITOR, PUBLIC = DEFAULT_ROLE_NAMES
 
     name = models.CharField(max_length=255)
     instance = models.ForeignKey('Instance', null=True, blank=True)
     default_permission = models.IntegerField(choices=FieldPermission.choices,
                                              default=FieldPermission.NONE)
     rep_thresh = models.IntegerField()
-
-    @property
-    def tree_permissions(self):
-        return self.model_permissions('Tree')
-
-    @property
-    def plot_permissions(self):
-        return self.model_permissions('Plot')
-
-    def model_permissions(self, model_name):
-        return role_permissions(self, self.instance, model_name)
 
     def __unicode__(self):
         return '%s (%s)' % (self.name, self.pk)
@@ -794,9 +798,9 @@ class Authorizable(UserTrackable):
         return fields_to_audit
 
     def mask_unauthorized_fields(self, user):
-        perms = permissions(user, self.instance, self._model_name)
         readable_fields = {perm.field_name for perm
-                           in perms
+                           in permissions(user, self.instance,
+                                          self._model_name)
                            if perm.allows_reads}
 
         fields = set(self.get_previous_state().keys())
@@ -840,9 +844,8 @@ class Authorizable(UserTrackable):
         self._assert_not_masked()
 
         if self.pk is not None:
-            writable_perms = self._get_writeable_perms_set(user)
             for field in self._updated_fields():
-                if field not in writable_perms:
+                if field not in self._get_writeable_perms_set(user):
                     raise AuthorizeException("Can't edit field %s on %s" %
                                             (field, self._model_name))
 
@@ -980,8 +983,7 @@ class Auditable(UserTrackable):
         # manifest itself in the audit log, essentially keeping
         # a revision id of this instance. Since each primary
         # key will be unique, we can just use that for the hash
-        audits = Audit.objects.filter(instance__pk=self.instance_id)\
-                              .filter(model=self._model_name)\
+        audits = Audit.objects.filter(model=self._model_name)\
                               .filter(model_id=self.pk)\
                               .order_by('-updated')
 
@@ -1182,17 +1184,27 @@ class Audit(models.Model):
     An audit that is "PendingApproved/Rejected" cannot be be
     "ReviewApproved/Rejected"
     """
+
+    def __init__(self, *args, **kwargs):
+        super(Audit, self).__init__(*args, **kwargs)
+        # attempting to store a list in a text field will produce a
+        # printed representation of a python object, which cannot be
+        # safely deserialized (without using eval). For audits on
+        # multichoice udfs, we need to store JSON in order to be able
+        # to work with these values. Since the audit object doesn't
+        # carry a direct reference to the udfd in question, it should
+        # be sufficient to just inspect the type and encode lists.
+        if isinstance(self.previous_value, list):
+            self.previous_value = json.dumps(self.previous_value)
+        if isinstance(self.current_value, list):
+            self.current_value = json.dumps(self.current_value)
+
     requires_auth = models.BooleanField(default=False)
     ref = models.ForeignKey('Audit', null=True)
 
     created = models.DateTimeField(auto_now_add=True, db_index=True)
     updated = models.DateTimeField(auto_now=True, db_index=True)
 
-    # TODO: this does nothing because south manages this app
-    # and we're still on 0.7.x, which doesn't support index_together
-    # after an upgrade to south 0.8.x or, more likely, to django 1.7,
-    # this will be kept in sync with database versioning. For now,
-    # it is manually managed using migration 0081.
     class Meta:
         index_together = [
             ['instance', 'user', 'updated']
@@ -1245,11 +1257,14 @@ class Audit(models.Model):
                 udfd_pk = int(self.model[4:])
                 udf_def = next((udfd for udfd in udfds if udfd.pk == udfd_pk),
                                None)
-                datatype = udf_def.datatype_by_field[field_name]
+                if udf_def is not None:
+                    datatype = udf_def.datatype_by_field[field_name]
             else:
                 udf_def = next((udfd for udfd in udfds
-                                if udfd.name == field_name), None)
-                datatype = udf_def.datatype_dict
+                                if udfd.name == field_name
+                                and udfd.model_type == self.model), None)
+                if udf_def is not None:
+                    datatype = udf_def.datatype_dict
             if udf_def is not None:
                 return udf_def.clean_value(value, datatype)
             else:
@@ -1288,7 +1303,6 @@ class Audit(models.Model):
         return field_modified_value
 
     def _unit_format(self, value):
-        model_name = self.model.lower()
 
         if isinstance(value, GEOSGeometry):
             if value.geom_type == 'Point':
@@ -1297,6 +1311,12 @@ class Audit(models.Model):
                 value = value.area
         elif isinstance(value, datetime):
             value = dformat(value, settings.SHORT_DATE_FORMAT)
+        elif isinstance(value, list):
+            # Translators: 'none' in this case refers to clearing the
+            # list. Should be a human-friendly translation of 'null'
+            value = '(%s)' % ', '.join(value) if value else _('none')
+
+        model_name = to_object_name(self.model)
 
         if is_convertible_or_formattable(model_name, self.field):
             __, value = get_display_value(
@@ -1363,14 +1383,18 @@ class Audit(models.Model):
 
         format_string = cls.action_format_string_for_audit(self)
 
-        if hasattr(cls, 'display_name'):
-            model_display_name = cls.display_name
-        else:
-            model_display_name = _(self.model)
+        model_display_name = self.model_display_name()
 
         return format_string % {'field': self.field_display_name,
                                 'model': model_display_name.lower(),
                                 'value': self.current_display_value}
+
+    def model_display_name(self):
+        cls = get_auditable_class(self.model)
+        if issubclass(cls, Convertible):
+            return cls.display_name(self.instance)
+        else:
+            return cls.__name__
 
     def dict(self):
         return {'model': self.model,
@@ -1468,7 +1492,7 @@ def _get_model_class(class_dict, cls, model_name):
 
     if not class_dict:
         # One-time load of class dictionary
-        for c in all_subclasses(cls):
+        for c in all_models_of_class(cls):
             class_dict[c.__name__] = c
 
     return class_dict[model_name]

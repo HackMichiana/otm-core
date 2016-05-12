@@ -4,7 +4,6 @@ var _ = require('lodash'),
     Bacon = require('baconjs'),
     url = require('url'),
     L = require('leaflet'),
-    History = require('history'),
 
     modeNamesForUrl = [
         require('treemap/addTreeMode').name,
@@ -19,23 +18,26 @@ var _state = null,
     _window = null;
 
 function HistoryApi() {
+    var stateChangeCallback = null;
+
     function onStateChange(callback) {
-        History.Adapter.bind(window, 'statechange', callback);
-        // We use the "History" library for "pushState" etc. capabilities on IE9.
-        // If we drop IE9 support we should change "History" to "history" in this
-        // module, and replace the above "bind" call with:
-        //        window.onpopstate = function(event) {
-        //            setStateAndPushToApp(event.state || getStateFromCurrentUrl());
-        //        };
+        stateChangeCallback = callback;
+        window.onpopstate = callback;
     }
     function getState() {
-        return History.getState();
+        return history.state;
     }
     function pushState(state, title, url) {
-        History.pushState(state, title, url);
+        history.pushState(state, title, url);
+        if (stateChangeCallback) {
+            stateChangeCallback();
+        }
     }
     function replaceState(state, title, url) {
-        History.replaceState(state, title, url);
+        history.replaceState(state, title, url);
+        if (stateChangeCallback) {
+            stateChangeCallback();
+        }
     }
     return {
         onStateChange: onStateChange,
@@ -44,7 +46,6 @@ function HistoryApi() {
         replaceState: replaceState
     };
 }
-
 
 function WindowApi() {
     return {
@@ -125,6 +126,10 @@ function set(key, value, options) {
         var newState = _.extend({}, _state);
         newState[key] = value;
 
+        // Serialize and deserialize state to ensure that deserializing state
+        // from the URL will match the stored state (mostly matter for float precision)
+        newState = getStateFromUrl(getUrlFromState(newState));
+
         // Prevent data from being pushed to _stateChangeBus by making _state
         // identical to newState.
         if (options.silent) {
@@ -195,8 +200,12 @@ module.exports = {
 };
 
 function getStateFromCurrentUrl() {
+    return getStateFromUrl(_window.getLocationHref());
+}
+
+function getStateFromUrl(urlText) {
     var newState = {},
-        query = url.parse(_window.getLocationHref(), true).query,
+        query = url.parse(urlText, true).query,
         allKeys = _.union(_.keys(deserializers), _.keys(query));
 
     _.each(allKeys, function(k) {

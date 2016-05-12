@@ -1,8 +1,9 @@
- # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 from __future__ import print_function
 from __future__ import unicode_literals
 from __future__ import division
 
+import json
 import re
 from modgrammar import Grammar, OPTIONAL, G, WORD, OR, ParseError
 
@@ -15,7 +16,7 @@ from django.conf import settings
 
 from opentreemap.util import dotted_split
 
-from treemap.util import safe_get_model_class, to_object_name, to_model_name
+from treemap.util import get_model_for_instance, to_object_name
 from treemap.json_field import (is_json_field_reference,
                                 get_attr_from_json_field)
 from treemap.units import (get_digits_if_formattable, get_units_if_convertible,
@@ -36,6 +37,7 @@ _identifier_regex = re.compile(
 FIELD_MAPPINGS = {
     'IntegerField': 'int',
     'ForeignKey': 'int',
+    'OneToOneField': 'int',
     'AutoField': 'int',
     'FloatField': 'float',
     'TextField': 'long_string',
@@ -46,10 +48,10 @@ FIELD_MAPPINGS = {
     'NullBooleanField': 'bool',
     'FileField': 'string',
     'PointField': 'point',
-    'MultiPolygonField': 'multipolygon'
+    'MultiPolygonField': 'multipolygon',
 }
 
-VALID_FIELD_KEYS = ','.join([k for k, v in FIELD_MAPPINGS.iteritems()])
+VALID_FIELD_KEYS = ','.join(FIELD_MAPPINGS.keys())
 
 
 class Variable(Grammar):
@@ -57,8 +59,13 @@ class Variable(Grammar):
                | WORD(b"a-zA-Z_", b"a-zA-Z0-9_."))
 
 
+class Label(Grammar):
+    grammar = (G(b'_("', WORD(b'^"'), b'")') | G(b"_('", WORD(b"^'"), b"')")
+               | Variable)
+
+
 class InlineEditGrammar(Grammar):
-    grammar = (OR(G(OR(b"field", b"create"), OPTIONAL(Variable)), b"search"),
+    grammar = (OR(G(OR(b"field", b"create"), OPTIONAL(Label)), b"search"),
                b"from", Variable, OPTIONAL(b"for", Variable),
                OPTIONAL(b"in", Variable), b"withtemplate", Variable)
     grammar_whitespace = True
@@ -138,8 +145,8 @@ def inline_edit_tag(tag, Node):
     {% field "First" from "user.first_name" withtemplate "template.html" %}
 
     For simple use cases, the label can be omitted, in which case the
-    translated help_text property (for Django fields) or the name (for UDFs) of
-    the underlying field is provided as the label.
+    translated verbose_name property (for Django fields) or the name (for UDFs)
+    of the underlying field is provided as the label.
 
     {% field from "user.first_name" withtemplate "template.html" %}
     {% field from "user.first_name" for user withtemplate "template.html" %}
@@ -229,22 +236,28 @@ def _resolve_variable(variable, context):
 
 
 def _is_udf(model, udf_field_name):
-            return (hasattr(model, 'udf_field_names') and
-                    udf_field_name in model.udf_field_names)
+    return (hasattr(model, 'udf_field_names') and
+            udf_field_name in model.udf_field_names)
 
 
 def _udf_dict(model, field_name):
-            matches = [field.datatype_dict
-                       for field
-                       in model.get_user_defined_fields()
-                       if field.name == field_name.replace('udf:', '')]
-            if matches:
-                return matches[0]
-            else:
-                raise Exception("Datatype for field %s not found" % field_name)
+    matches = [field.datatype_dict
+               for field in model.get_user_defined_fields()
+               if field.name == field_name.replace('udf:', '')]
+    if matches:
+        return matches[0]
+    else:
+        raise Exception("Datatype for field %s not found" % field_name)
 
 
-def field_type_label_choices(model, field_name, label):
+# Should a blank choice be added for choice and multichoice fields?
+ADD_BLANK_ALWAYS = 0
+ADD_BLANK_NEVER = 1
+ADD_BLANK_IF_CHOICE_FIELD = 2
+
+
+def field_type_label_choices(model, field_name, label=None,
+                             add_blank=ADD_BLANK_IF_CHOICE_FIELD):
     choices = None
     udf_field_name = field_name.replace('udf:', '')
     if not _is_udf(model, udf_field_name):
@@ -256,7 +269,7 @@ def field_type_label_choices(model, field_name, label):
             raise Exception('This template tag only supports %s not %s'
                             % (VALID_FIELD_KEYS,
                                field_type))
-        label = label if label else field.help_text
+        label = label if label else field.verbose_name
         choices = [{'value': choice[0], 'display_value': choice[1]}
                    for choice in field.choices]
         if choices and field.null:
@@ -266,9 +279,13 @@ def field_type_label_choices(model, field_name, label):
         field_type = udf_dict['type']
         label = label if label else udf_field_name
         if 'choices' in udf_dict:
-            values = [''] + udf_dict['choices']
             choices = [{'value': value, 'display_value': value}
-                       for value in values]
+                       for value in udf_dict['choices']]
+            if add_blank == ADD_BLANK_ALWAYS or (
+                add_blank == ADD_BLANK_IF_CHOICE_FIELD
+                    and field_type == 'choice'
+            ):
+                choices.insert(0, {'value': "", 'display_value': ""})
 
     return field_type, label, choices
 
@@ -292,6 +309,11 @@ class AbstractNode(template.Node):
     def get_additional_context(self, field, *args):
         return field
 
+    # Overriden in SearchNode
+    @property
+    def treat_multichoice_as_choice(self):
+        return False
+
     def render(self, context):
         label, identifier = self.resolve_label_and_identifier(context)
         user = _resolve_variable(self.user, context)
@@ -312,7 +334,7 @@ class AbstractNode(template.Node):
         object_name = to_object_name(model_name_or_object_name)
         identifier = "%s.%s" % (object_name, field_name)
 
-        def _field_value(model, field_name):
+        def _field_value(model, field_name, data_type):
             udf_field_name = field_name.replace('udf:', '')
             if field_name in model._meta.get_all_field_names():
                 try:
@@ -321,6 +343,11 @@ class AbstractNode(template.Node):
                     val = None
             elif _is_udf(model, udf_field_name):
                 val = model.udfs[udf_field_name]
+                # multichoices place a json serialized data-value
+                # on the dom element and client-side javascript
+                # processes it into a view table and edit widget
+                if data_type == 'multichoice':
+                    val = json.dumps(val)
             else:
                 raise ValueError('Could not find field: %s' % field_name)
 
@@ -332,9 +359,11 @@ class AbstractNode(template.Node):
             is_visible = is_editable = True
             data_type = "string"
         else:
-            field_value = _field_value(model, field_name)
+            add_blank = (ADD_BLANK_ALWAYS if self.treat_multichoice_as_choice
+                         else ADD_BLANK_IF_CHOICE_FIELD)
             data_type, label, choices = field_type_label_choices(
-                model, field_name, label)
+                model, field_name, label, add_blank=add_blank)
+            field_value = _field_value(model, field_name, data_type)
 
             if user is not None and hasattr(model, 'field_is_visible'):
                 is_visible = model.field_is_visible(user, field_name)
@@ -358,12 +387,10 @@ class AbstractNode(template.Node):
 
         if field_value is None:
             display_val = None
-        elif data_type == 'date' and model.instance:
-            display_val = dateformat.format(field_value,
-                                            model.instance.short_date_format)
-        elif data_type == 'date':
-            display_val = dateformat.format(field_value,
-                                            settings.SHORT_DATE_FORMAT)
+        elif data_type in ['date', 'datetime']:
+            fmt = (model.instance.short_date_format if model.instance
+                   else settings.SHORT_DATE_FORMAT)
+            display_val = dateformat.format(field_value, fmt)
         elif is_convertible_or_formattable(object_name, field_name):
             display_val = format_value(
                 model.instance, object_name, field_name, field_value)
@@ -371,6 +398,15 @@ class AbstractNode(template.Node):
                 display_val += (' %s' % units)
         elif data_type == 'bool':
             display_val = _('Yes') if field_value else _('No')
+        elif data_type == 'multichoice':
+            # this is rendered clientside from data attributes so
+            # there's no meaningful intermediate value to send
+            # without rendering the same markup server-side.
+            display_val = None
+        elif choices:
+            display_vals = [choice['display_value'] for choice in choices
+                            if choice['value'] == field_value]
+            display_val = display_vals[0] if display_vals else field_value
         else:
             display_val = unicode(field_value)
 
@@ -384,7 +420,7 @@ class AbstractNode(template.Node):
             'data_type': data_type,
             'is_visible': is_visible,
             'is_editable': is_editable,
-            'choices': choices
+            'choices': choices,
         }
         self.get_additional_context(context['field'])
 
@@ -398,12 +434,7 @@ class FieldNode(AbstractNode):
 
 class CreateNode(AbstractNode):
     def get_model(self, __, object_name, instance=None):
-        Model = safe_get_model_class(to_model_name(object_name))
-
-        if instance and hasattr(Model, 'instance'):
-            return Model(instance=instance)
-        else:
-            return Model()
+        return get_model_for_instance(object_name, instance)
 
 
 class SearchNode(CreateNode):
@@ -423,8 +454,33 @@ class SearchNode(CreateNode):
         # update endpoints, so we shouldn't overwrite it :(
         field.update({k: v for k, v in self.search_json.items()
                       if v is not None and k != 'identifier'})
+
+        data_type = field['data_type']
+        if 'search_type' not in field:
+            if data_type in {'int', 'float', 'date', 'datetime'}:
+                field['search_type'] = 'RANGE'
+            elif data_type in {'long_string', 'string', 'multichoice'}:
+                field['search_type'] = 'LIKE'
+            else:
+                field['search_type'] = 'IS'
+
+        if data_type == 'multichoice':
+            field['data_type'] = 'choice'
+            # Choices will be used to search multichoice values (stored as
+            # JSON) using a LIKE query. Add quotes around the choice values
+            # so e.g. a search for "car" will match "car" but not "carp".
+            for choice in field['choices']:
+                if choice['value']:
+                    choice['value'] = '"%s"' % choice['value']
+
         return field
+
+    @property
+    def treat_multichoice_as_choice(self):
+        # When used for searching, multichoice and choice fields act the same
+        return True
 
 register.tag('field', inline_edit_tag('field', FieldNode))
 register.tag('create', inline_edit_tag('create', CreateNode))
 register.tag('search', inline_edit_tag('search', SearchNode))
+register.filter('to_object_name', to_object_name)

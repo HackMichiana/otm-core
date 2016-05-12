@@ -1,4 +1,5 @@
 import os
+from omgeo import postprocessors
 
 # Django settings for opentreemap project.
 OTM_VERSION = 'dev'
@@ -7,8 +8,12 @@ API_VERSION = 'v0.1'
 FEATURE_BACKEND_FUNCTION = None
 USER_ACTIVATION_FUNCTION = None
 
+ECOSERVICE_NAME = 'ecoservice'
+
 UITEST_CREATE_INSTANCE_FUNCTION = 'treemap.tests.make_instance'
 UITEST_SETUP_FUNCTION = None
+
+EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
 
 # This email is shown in various contact/error pages
 # throughout the site
@@ -62,8 +67,46 @@ MANAGERS = ADMINS
 
 TEST_RUNNER = "treemap.tests.OTM2TestRunner"
 
-OMGEO_SETTINGS = [[
-    'omgeo.services.EsriWGS', {}
+OMGEO_SETTINGS = [[  # Used when no suggestion has been chosen
+    'omgeo.services.EsriWGS',
+    {
+        'preprocessors': [],
+        'postprocessors': [
+            postprocessors.AttrFilter(
+                good_values=['PointAddress', 'BuildingName', 'StreetAddress',
+                             'StreetName'],
+                attr='locator_type'),
+            postprocessors.DupePicker(  # Filters by highest score
+                attr_dupes='match_addr',
+                attr_sort='locator_type',
+                ordered_list=['PointAddress', 'BuildingName', 'StreetAddress']
+            ),
+            postprocessors.AttrSorter(
+                ordered_values=['PointAddress', 'StreetAddress', 'StreetName'],
+                attr='locator_type'),
+            postprocessors.GroupBy('match_addr'),
+            postprocessors.GroupBy(('x', 'y')),
+            postprocessors.SnapPoints(distance=10)
+        ]
+    }
+]]
+
+OMGEO_SETTINGS_FOR_MAGIC_KEY = [[  # Used when a suggestion has been chosen
+    'omgeo.services.EsriWGS',
+    {
+        'preprocessors': [],
+        'postprocessors': [
+            postprocessors.UseHighScoreIfAtLeast(99),
+            postprocessors.DupePicker(  # Filters by highest score
+                attr_dupes='match_addr',
+                attr_sort='locator_type',
+                ordered_list=['PointAddress', 'BuildingName', 'StreetAddress']
+            ),
+            postprocessors.GroupBy('match_addr'),
+            postprocessors.GroupBy(('x', 'y')),
+            postprocessors.SnapPoints(distance=10)
+        ]
+    }
 ]]
 
 # Set TILE_HOST to None if the tiler is running on the same host
@@ -105,11 +148,11 @@ USE_TZ = True
 
 # Path to the Django Project root
 # Current file is in opentreemap/opentreemap/settings, so go up 3
-PROJECT_ROOT = os.path.abspath(
+BASE_DIR = os.path.abspath(
     os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 # Path to the location of SCSS files, used for on-the-fly compilation to CSS
-SCSS_ROOT = os.path.join(PROJECT_ROOT, 'treemap', 'css', 'sass')
+SCSS_ROOT = os.path.join(BASE_DIR, 'treemap', 'css', 'sass')
 
 # Entry point .scss file for on-the-fly compilation to CSS
 SCSS_ENTRY = 'main'
@@ -175,6 +218,28 @@ MIDDLEWARE_CLASSES = (
     # 'django.middleware.clickjacking.XFrameOptionsMiddleware',
 )
 
+# Settings for Rollbar exception reporting service
+ROLLBAR_ACCESS_TOKEN = os.environ.get('ROLLBAR_SERVER_SIDE_ACCESS_TOKEN', None)
+STACK_TYPE = os.environ.get('OTM_STACK_TYPE', 'Unknown')
+if ROLLBAR_ACCESS_TOKEN is not None:
+    ROLLBAR = {
+        'access_token': ROLLBAR_ACCESS_TOKEN,
+        'environment': STACK_TYPE,
+        'root': BASE_DIR
+    }
+    MIDDLEWARE_CLASSES += (
+        'rollbar.contrib.django.middleware.RollbarNotifierMiddleware',)
+
+# Settings for StatsD metrics aggregation
+STATSD_CLIENT = 'django_statsd.clients.normal'
+STATSD_PREFIX = '{}.django'.format(STACK_TYPE.lower())
+STATSD_HOST = os.environ.get('OTM_STATSD_HOST', 'localhost')
+STATSD_CELERY_SIGNALS = True
+
+STACK_COLOR = os.environ.get('OTM_STACK_COLOR', 'Black')
+CELERY_DEFAULT_QUEUE = STACK_COLOR
+CELERY_DEFAULT_ROUTING_KEY = "task.%s" % STACK_COLOR
+
 ROOT_URLCONF = 'opentreemap.urls'
 
 # Python dotted path to the WSGI application used by Django's runserver.
@@ -219,12 +284,13 @@ MANAGED_APPS = (
     'otm1_migrator',
     'otm_comments',
     'importer',
-    'appevents'
+    'appevents',
+    'stormwater',
 )
 
 UNMANAGED_APPS = (
     'threadedcomments',
-    'django.contrib.comments',
+    'django_comments',
     'registration',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -237,7 +303,7 @@ UNMANAGED_APPS = (
     'django.contrib.humanize',
     'django_hstore',
     'djcelery',
-    'south',
+    'url_tools',
 )
 
 I18N_APPS = (
@@ -266,6 +332,10 @@ RESERVED_INSTANCE_URL_NAMES = (
 # may be deleted by maintenance scripts provided in django-registration.
 ACCOUNT_ACTIVATION_DAYS = 7
 
+# Django-registration-redux sends HTML emails by default as of version 1.2
+# Disabling them for now until we add some new email templates
+REGISTRATION_EMAIL_HTML = False
+
 #
 # Units and decimal digits for fields and eco values
 #
@@ -290,11 +360,20 @@ DISPLAY_DEFAULTS = {
         'co2':        {'units': 'lbs/year', 'digits': 1},
         'co2storage': {'units': 'lbs', 'digits': 1},
         'airquality': {'units': 'lbs/year', 'digits': 1}
-    }
+    },
+    'rainBarrel': {
+        'capacity': {'units': 'gal', 'digits': 1}
+    },
 }
 
 # Time in ms for two clicks to be considered a double-click in some scenarios
 DOUBLE_CLICK_INTERVAL = 300
+
+# The number of plots to import per task
+IMPORT_BATCH_SIZE = 85
+
+# The rate limit for how frequently batches of imports can happen per worker
+IMPORT_COMMIT_RATE_LIMIT = "1/m"
 
 # We have... issues on IE9 right now
 # Disable it on production, but enable it in Debug mode
@@ -303,5 +382,6 @@ IE_VERSION_MINIMUM = 9 if DEBUG else 10
 IE_VERSION_UNSUPPORTED_REDIRECT_PATH = '/unsupported'
 
 USE_OBJECT_CACHES = True
+USE_ECO_CACHE = True
 
 BING_API_KEY = None

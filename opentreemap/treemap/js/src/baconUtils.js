@@ -2,6 +2,7 @@
 
 var Bacon = require('baconjs'),
     $ = require('jquery'),
+    url = require('url'),
     R = require('ramda'),
     _ = require('lodash');
 
@@ -181,8 +182,19 @@ exports.reloadContainerOnClick = function ($container /*, selector1, selector2, 
         .filter(isDefinedNonEmpty) // ignore empty hrefs
         .onValue(function (url) {
             $container.load(url, function () {
-                htmlLoadedBus.push();
+                htmlLoadedBus.push(url);
             });
         });
     return htmlLoadedBus.toEventStream();  // in case further handling is desired
+};
+
+exports.reloadContainerOnClickAndRecordUrl = function() {
+    var stream = exports.reloadContainerOnClick.apply(this, arguments);
+    stream.onValue(exports.recordUrl);
+    return stream;
+};
+
+exports.recordUrl = function(partialUrl) {
+    var params = url.parse(partialUrl).query;
+    history.replaceState(null, document.title, '?' + params + window.location.hash);
 };

@@ -15,8 +15,9 @@ _import_api_pattern = _type_pattern + '/' + _ie_pattern
 urlpatterns = patterns(
     '',
     url(r'^$', routes.list_imports, name='list_imports'),
-    url(r'^refresh$', routes.refresh_imports, name='refresh_imports'),
-    url(r'^start_import$', routes.start_import, name='start_import'),
+    url(r'^table/(?P<table_name>\w+)/$', routes.get_import_table,
+        name='get_import_table'),
+    url(r'^start_import/$', routes.start_import, name='start_import'),
     url(r'^status/%s/' % _import_api_pattern, routes.show_import_status,
         name='status'),
     url(r'^cancel/%s/$' % _import_api_pattern, routes.cancel, name='cancel'),
@@ -30,6 +31,9 @@ urlpatterns = patterns(
         name='export_all_species'),
     url(r'^export/%s/$' % _import_api_pattern, routes.export_single_import,
         name='export_single_import'),
+    url(r'^download_template/%s/$' % _type_pattern,
+        routes.download_import_template,
+        name='download_import_template'),
 
     # API
     url(r'^api/merge$', routes.merge_species, name='merge'),

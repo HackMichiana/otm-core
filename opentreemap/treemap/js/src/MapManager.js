@@ -2,18 +2,26 @@
 
 var $ = require('jquery'),
     _ = require('lodash'),
+    R = require('ramda'),
     L = require('leaflet'),
+    Bacon = require('baconjs'),
+    format = require('util').format,
+    urlLib = require('url'),
     U = require('treemap/utility'),
     BU = require('treemap/baconUtils'),
-    makeLayerFilterable = require('treemap/makeLayerFilterable'),
     urlState = require('treemap/urlState'),
 
-    _ZOOM_OPTIONS = {maxZoom: 21};
+    layersLib = require('treemap/layers'),
+
+    MIN_ZOOM_OPTION = layersLib.MIN_ZOOM_OPTION,
+    MAX_ZOOM_OPTION = layersLib.MAX_ZOOM_OPTION,
+    BASE_LAYER_OPTION = layersLib.BASE_LAYER_OPTION;
 
 // Leaflet extensions
 require('utfgrid');
 require('leafletbing');
 require('leafletgoogle');
+require('esri-leaflet');
 
 var MapManager = function() {};  // constructor
 
@@ -23,16 +31,15 @@ MapManager.prototype = {
 
     createTreeMap: function (options) {
         var config = options.config,
-            plotLayer = createPlotTileLayer(config),
-            allPlotsLayer = createPlotTileLayer(config),
-            boundsLayer = createBoundsTileLayer(config),
-            utfLayer = createPlotUTFLayer(config);
-
+            hasPolygons = getDomMapBool('has-polygons', options.domId),
+            hasBoundaries = getDomMapBool('has-boundaries', options.domId),
+            plotLayer = layersLib.createPlotTileLayer(config),
+            allPlotsLayer = layersLib.createPlotTileLayer(config),
+            utfLayer = layersLib.createPlotUTFLayer(config);
         this._config = config;
         this._plotLayer = plotLayer;
         this._allPlotsLayer = allPlotsLayer;
         this._utfLayer = utfLayer;
-
         allPlotsLayer.setOpacity(0.3);
 
         options.centerWM = options.centerWM || config.instance.center;
@@ -44,11 +51,57 @@ MapManager.prototype = {
         } else {
             map.addLayer(plotLayer);
             map.addLayer(utfLayer);
-            map.utfEvents = BU.leafletEventStream(utfLayer, 'click');
+            var baseUtfEventStream = BU.leafletEventStream(utfLayer, 'click');
+
+            if (hasPolygons) {
+                var polygonLayer = layersLib.createPolygonTileLayer(config),
+                    allPolygonsLayer = layersLib.createPolygonTileLayer(config);
+                this._hasPolygons = hasPolygons;
+                this._polygonLayer = polygonLayer;
+                this._allPolygonsLayer = allPolygonsLayer;
+                allPolygonsLayer.setOpacity(0.3);
+                map.addLayer(polygonLayer);
+
+                fixZoomLayerSwitch(map, polygonLayer);
+                fixZoomLayerSwitch(map, allPolygonsLayer);
+
+                // When a map has polygons, we check to see if a utf event was
+                // for a dot, and if not, and if the map is zoomed in enough to
+                // see polygons, we make an AJAX call to see if there
+                // is a polygon in that location.
+                var shouldCheckForPolygon = function(e) {
+                        return map.getZoom() >= MIN_ZOOM_OPTION.minZoom && e.data === null;
+                    },
+                    plotUtfEventStream = baseUtfEventStream.filter(R.not(shouldCheckForPolygon)),
+                    emptyUtfEventStream = baseUtfEventStream.filter(shouldCheckForPolygon),
+
+                    polygonDataStream = emptyUtfEventStream.map(function(e) {
+                        var lat = e.latlng.lat,
+                            lng = e.latlng.lng,
+                            // The distance parameter changes as a function of zoom
+                            // halving with every zoom level.  I arrived at 20
+                            // meters at zoom level 15 through trial and error
+                            dist = 20 / Math.pow(2, map.getZoom() - MIN_ZOOM_OPTION.minZoom);
+
+                        return config.instance.polygonForPointUrl + format('?lng=%d&lat=%d&distance=%d', lng, lat, dist);
+                    }).flatMap(BU.getJsonFromUrl);
+
+                map.utfEvents = Bacon.mergeAll(
+                    plotUtfEventStream,
+                    polygonDataStream
+                );
+            } else {
+                map.utfEvents = baseUtfEventStream;
+            }
         }
 
-        map.addLayer(boundsLayer);
-        this.layersControl.addOverlay(boundsLayer, 'Boundaries');
+        if (hasBoundaries) {
+            var boundariesLayer = layersLib.createBoundariesTileLayer(config);
+            map.addLayer(boundariesLayer);
+            this.layersControl.addOverlay(boundariesLayer, 'Boundaries');
+
+            fixZoomLayerSwitch(map, boundariesLayer);
+        }
 
         if (options.trackZoomLatLng) {
             map.on("moveend", _.partial(serializeZoomLatLngFromMap, map));
@@ -87,26 +140,35 @@ MapManager.prototype = {
         return map;
     },
 
-    updateGeoRevHash: function (geoRevHash) {
-        if (geoRevHash !== this._config.instance.rev) {
-            this._config.instance.rev = geoRevHash;
+    updateRevHashes: function (response) {
+        this._utfLayer.setHashes(response);
+        this._plotLayer.setHashes(response);
+        this._allPlotsLayer.setHashes(response);
 
-            var pngUrl = getPlotLayerURL(this._config, 'png');
-            this._plotLayer.setUnfilteredUrl(pngUrl);
-            this._allPlotsLayer.setUnfilteredUrl(pngUrl);
-
-            this._utfLayer.setUrl(getPlotLayerURL(this._config, 'grid.json'));
+        if (this._hasPolygons) {
+            this._polygonLayer.setHashes(response);
+            this._allPolygonsLayer.setHashes(response);
         }
     },
 
     setFilter: function (filter) {
         this._plotLayer.setFilter(filter);
 
+        if (this._hasPolygons) {
+            this._polygonLayer.setFilter(filter);
+        }
+
         if (!this._allPlotsLayer.map) {
             this.map.addLayer(this._allPlotsLayer);
+            if (this._hasPolygons) {
+                this.map.addLayer(this._allPolygonsLayer);
+            }
         }
         if (_.isEmpty(filter)) {
             this.map.removeLayer(this._allPlotsLayer);
+            if (this._hasPolygons) {
+                this.map.removeLayer(this._allPolygonsLayer);
+            }
         }
     },
 
@@ -136,85 +198,47 @@ MapManager.prototype = {
 };
 
 function getBasemapLayers(config) {
+    var options = _.extend({}, MAX_ZOOM_OPTION, BASE_LAYER_OPTION);
+
     function makeBingLayer(layer) {
         return new L.BingLayer(
             config.instance.basemap.bing_api_key,
-            {type: layer});
+            _.extend(options, {type: layer}));
     }
 
-    var layers;
+    function makeEsriLayer(key) {
+        var layer = L.esri.basemapLayer(key, options);
+        layer.on('load', function () {
+            // Otherwise basemap is behind plot layer (esri-leaflet 1.0.2, leaflet 0.7.3)
+            layer.setZIndex(BASE_LAYER_OPTION.zIndex);
+        });
+        return layer;
+    }
+
     if (config.instance.basemap.type === 'bing') {
         return {
             'Road': makeBingLayer('Road'),
             'Aerial': makeBingLayer('Aerial'),
             'Hybrid': makeBingLayer('AerialWithLabels')
         };
+    } else if (config.instance.basemap.type === 'esri') {
+        return {
+            'Streets': makeEsriLayer("Topographic"),
+            'Hybrid': L.layerGroup([
+                makeEsriLayer("Imagery"),
+                makeEsriLayer("ImageryTransportation")
+            ]),
+            'Satellite': makeEsriLayer("Imagery")
+        };
     } else if (config.instance.basemap.type === 'tms') {
-        layers = [L.tileLayer(config.instance.basemap.data, _ZOOM_OPTIONS)];
+        return [L.tileLayer(config.instance.basemap.data, options)];
     } else {
-        return {'Streets': new L.Google('ROADMAP', _ZOOM_OPTIONS),
-                'Hybrid': new L.Google('HYBRID', _ZOOM_OPTIONS),
-                'Satellite': new L.Google('SATELLITE', _ZOOM_OPTIONS)};
+        return {
+            'Streets': new L.Google('ROADMAP', options),
+            'Hybrid': new L.Google('HYBRID', options),
+            'Satellite': new L.Google('SATELLITE', options)
+        };
     }
-    return layers;
-}
-
-function createPlotTileLayer(config) {
-    var url = getPlotLayerURL(config, 'png'),
-        layer = L.tileLayer(url, _ZOOM_OPTIONS);
-    makeLayerFilterable(layer, url, config);
-    return layer;
-}
-
-function createPlotUTFLayer(config) {
-    var layer, url = getPlotLayerURL(config, 'grid.json'),
-        options = _.extend({resolution: 4}, _ZOOM_OPTIONS);
-
-    // Need to use JSONP on on browsers that do not support CORS (IE9)
-    // Only applies to plot layer because only UtfGrid is using XmlHttpRequest
-    // for cross-site requests
-    if (!$.support.cors) {
-        url += '&callback={cb}';
-        options.useJsonP = true;
-    } else {
-        options.useJsonP = false;
-    }
-
-    layer = new L.UtfGrid(url, options);
-
-    layer.setUrl = function(url) {
-        // Poke some internals
-        // Update the url
-        layer._url = url;
-        // bust the cache
-        layer._cache = {};
-
-        // Trigger update
-        layer._update();
-    };
-
-    return layer;
-}
-
-// Leaflet uses {s} to indicate subdomains
-function getLayerURL(config, layer, extension) {
-    var host = config.tileHost || '';
-    return host + '/tile/' +
-        config.instance.rev +
-        '/database/otm/table/' + layer + '/{z}/{x}/{y}.' +
-        extension + '?instance_id=' + config.instance.id;
-}
-
-function getPlotLayerURL(config, extension) {
-    return getLayerURL(config, 'treemap_mapfeature', extension);
-}
-
-function getBoundsLayerURL(config, extension) {
-    return getLayerURL(config, 'treemap_boundary', extension);
-}
-
-function createBoundsTileLayer(config) {
-    return L.tileLayer(getBoundsLayerURL(config, 'png'), _ZOOM_OPTIONS);
 }
 
 function deserializeZoomLatLngAndSetOnMap(mapManager, state) {
@@ -227,6 +251,27 @@ function serializeZoomLatLngFromMap(map) {
     var zoom = map.getZoom(),
         center = map.getCenter();
     urlState.setZoomLatLng(zoom, center);
+}
+
+function getDomMapBool(dataAttName, domId) {
+    return (getDomMapAttribute(dataAttName, domId) == 'True');
+}
+
+function getDomMapAttribute(dataAttName, domId) {
+    domId = domId || 'map';
+    var $map = $('#' + domId),
+        value = $map.data(dataAttName);
+    return value;
+}
+
+// Work around https://github.com/Leaflet/Leaflet/issues/1905
+function fixZoomLayerSwitch(map, layer) {
+    map.on('zoomend', function(e) {
+        var zoom = map.getZoom();
+        if (zoom < MIN_ZOOM_OPTION.minZoom) {
+            layer._clearBgBuffer();
+        }
+    });
 }
 
 module.exports = MapManager;

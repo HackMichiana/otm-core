@@ -4,6 +4,11 @@ from __future__ import unicode_literals
 from __future__ import division
 
 import json
+import logging
+
+from rollbar.logger import RollbarHandler
+
+from django.conf import settings
 
 
 def json_from_request(request):
@@ -84,6 +89,12 @@ def force_obj_to_pk(obj):
     bar = Tree.objects.all()[0].pk
     assert(foo != bar)
     assert(force_obj_to_pk(foo) == force_obj_to_pk(bar))
+
+    Note that this function was written to deal with an insidious issue found
+    in django at the time of writing: sometimes `model.value_from_object` is
+    and integer and sometimes it is the related object itself and it was not
+    apparent after a source audit how to deduce what this value actually is
+    at a given point in a model's lifecycle.
     """
     if obj is None:
         return None
@@ -93,3 +104,18 @@ def force_obj_to_pk(obj):
         return obj.id
     else:
         return obj
+
+
+def get_ids_from_request(request):
+    ids_string = request.REQUEST.get('ids', None)
+    if ids_string:
+        return [int(id) for id in ids_string.split(',')]
+    else:
+        return []
+
+
+def add_rollbar_handler(logger, level=logging.WARNING):
+    if settings.ROLLBAR_ACCESS_TOKEN is not None:
+        rollbar_handler = RollbarHandler()
+        rollbar_handler.setLevel(level)
+        logger.addHandler(rollbar_handler)

@@ -11,6 +11,7 @@ from django_tinsel.decorators import json_api_call
 import itertools
 
 from treemap import ecobackend
+from treemap.ecocache import get_cached_benefits
 from treemap.models import MapFeature
 
 WATTS_PER_BTU = 0.29307107
@@ -51,7 +52,7 @@ class BenefitCalculator(object):
     In addition, values in a given group will be shown together.
 
     lookup-value-for-unit is used to format the units for display and
-    is opitional.
+    is optional.
 
     The basis dictionary provides info about what went into
     the calculation. It has the following schema:
@@ -80,16 +81,36 @@ class BenefitCalculator(object):
         return {}
 
 
+class CountOnlyBenefitCalculator(BenefitCalculator):
+    def __init__(self, clz):
+        self.clz = clz
+
+    def benefits_for_filter(self, instance, item_filter):
+        features = item_filter.get_objects(self.clz)
+        return ({},
+                {'resource':
+                 {'n_objects_used': 0,
+                  'n_objects_discarded': features.count()}})
+
+    def benefits_for_object(self, instance, obj):
+        return {}, {}, None
+
+
 class TreeBenefitsCalculator(BenefitCalculator):
     def _make_sql_from_query(self, query):
         sql, params = query.sql_with_params()
         cursor = connection.cursor()
-        return cursor.mogrify(sql, params)
+        # Returning a unicode SQL string ensures that any string
+        # replacements done to query string will not raise
+        # UnicodeDecodeError
+        return unicode(cursor.mogrify(sql, params), 'utf-8')
 
     def benefits_for_filter(self, instance, item_filter):
-        from treemap.models import Tree
+        from treemap.models import Plot, Tree
 
-        trees = item_filter.get_objects(Tree)
+        instance = item_filter.instance
+        plots = item_filter.get_objects(Plot)
+        trees = Tree.objects.filter(plot__in=plots)
         n_total_trees = trees.count()
 
         if not instance.has_itree_region():
@@ -102,16 +123,16 @@ class TreeBenefitsCalculator(BenefitCalculator):
             basis = {'plot':
                      {'n_objects_used': 0,
                       'n_objects_discarded': n_total_trees}}
-            empty_rslt = self._compute_currency_and_transform_units(
+            empty_rslt = compute_currency_and_transform_units(
                 instance, {})
             return (empty_rslt, basis)
 
         # When calculating benefits we can skip region information
         # if there is only one intersecting region or if the
         # instance forces a region on us
-        region_codes = instance.itree_region_codes()
-        if len(region_codes) == 1:
-            region_code = region_codes[0]
+        regions = instance.itree_regions()
+        if len(regions) == 1:
+            region_code = regions[0].code
         else:
             region_code = None
 
@@ -174,7 +195,7 @@ class TreeBenefitsCalculator(BenefitCalculator):
             for key in benefits:
                 benefits[key] /= percent
 
-        rslt = self._compute_currency_and_transform_units(instance, benefits)
+        rslt = compute_currency_and_transform_units(instance, benefits)
 
         basis = {'plot':
                  {'n_objects_used': n_computed_trees,
@@ -196,12 +217,12 @@ class TreeBenefitsCalculator(BenefitCalculator):
             rslt = None
             error = 'MISSING_SPECIES'
         else:
-            region = tree.itree_region
+            region_code = plot.itree_region.code
 
-            if region:
+            if region_code:
                 params = {'otmcode': tree.species.otm_code,
                           'diameter': tree.diameter,
-                          'region': region,
+                          'region': region_code,
                           'instanceid': instance.pk,
                           'speciesid': tree.species.pk}
 
@@ -212,7 +233,7 @@ class TreeBenefitsCalculator(BenefitCalculator):
                     rslt = {'error': err}
                     error = err
                 else:
-                    benefits = self._compute_currency_and_transform_units(
+                    benefits = compute_currency_and_transform_units(
                         instance, rawb['Benefits'])
 
                     rslt = benefits
@@ -226,81 +247,82 @@ class TreeBenefitsCalculator(BenefitCalculator):
 
         return (rslt, basis, error)
 
-    def _compute_currency_and_transform_units(self, instance, benefits):
 
-        hydrofactors = ['hydro_interception']
+def compute_currency_and_transform_units(instance, benefits):
 
-        aqfactors = ['aq_ozone_dep', 'aq_nox_dep', 'aq_nox_avoided',
-                     'aq_pm10_dep', 'aq_sox_dep', 'aq_sox_avoided',
-                     'aq_voc_avoided', 'aq_pm10_avoided', 'bvoc']
+    hydrofactors = ['hydro_interception']
 
-        co2factors = ['co2_sequestered', 'co2_avoided']
-        co2storagefactors = ['co2_storage']
+    aqfactors = ['aq_ozone_dep', 'aq_nox_dep', 'aq_nox_avoided',
+                 'aq_pm10_dep', 'aq_sox_dep', 'aq_sox_avoided',
+                 'aq_voc_avoided', 'aq_pm10_avoided', 'bvoc']
 
-        energyfactor = ['natural_gas', 'electricity']
+    co2factors = ['co2_sequestered', 'co2_avoided']
+    co2storagefactors = ['co2_storage']
 
-        # TODO:
-        # eco.py converts from kg -> lbs to use the
-        # itree defaults currency conversions but it looks like
-        # we are pulling from the speadsheets are in kgs... we
-        # need to verify units
-        groups = {
-            BenefitCategory.AIRQUALITY: ('lbs/year', aqfactors),
-            BenefitCategory.CO2: ('lbs/year', co2factors),
-            BenefitCategory.CO2STORAGE: ('lbs', co2storagefactors),
-            BenefitCategory.STORMWATER: ('gal', hydrofactors),
-            BenefitCategory.ENERGY: ('kwh', energyfactor)
-        }
+    energyfactor = ['natural_gas', 'electricity']
 
-        # currency conversions are in lbs, so do this calc first
-        # same with hydro
-        for benefit in aqfactors + co2factors:
-            if benefit in benefits:
-                benefits[benefit] *= LBS_PER_KG
+    # TODO:
+    # eco.py converts from kg -> lbs to use the
+    # itree defaults currency conversions but it looks like
+    # we are pulling from the speadsheets are in kgs... we
+    # need to verify units
+    groups = {
+        BenefitCategory.AIRQUALITY: ('lbs', aqfactors),
+        BenefitCategory.CO2: ('lbs', co2factors),
+        BenefitCategory.CO2STORAGE: ('lbs', co2storagefactors),
+        BenefitCategory.STORMWATER: ('gal', hydrofactors),
+        BenefitCategory.ENERGY: ('kwh', energyfactor)
+    }
 
-        if 'hydro_interception' in benefits:
-            benefits['hydro_interception'] *= GAL_PER_CUBIC_M
+    # currency conversions are in lbs, so do this calc first
+    # same with hydro
+    for benefit in aqfactors + co2factors:
+        if benefit in benefits:
+            benefits[benefit] *= LBS_PER_KG
 
-        factor_conversions = instance.factor_conversions
+    if 'hydro_interception' in benefits:
+        benefits['hydro_interception'] *= GAL_PER_CUBIC_M
 
-        for benefit in benefits:
-            value = benefits.get(benefit, 0)
+    factor_conversions = instance.factor_conversions
 
-            if factor_conversions and value and benefit in factor_conversions:
-                currency = factor_conversions[benefit] * value
-            else:
-                currency = 0.0
+    for benefit in benefits:
+        value = benefits.get(benefit, 0)
 
-            benefits[benefit] = (value, currency)
+        if factor_conversions and value and benefit in factor_conversions:
+            currency = factor_conversions[benefit] * value
+        else:
+            currency = 0.0
 
-        if 'natural_gas' in benefits:
-            # currency conversions are in kbtus, so do this after
-            # currency conversion
-            nat_gas_kbtu, nat_gas_cur = benefits['natural_gas']
-            nat_gas_kwh = nat_gas_kbtu * WATTS_PER_BTU
-            benefits['natural_gas'] = (nat_gas_kwh, nat_gas_cur)
+        benefits[benefit] = (value, currency)
 
-        rslt = {}
+    if 'natural_gas' in benefits:
+        # currency conversions are in kbtus, so do this after
+        # currency conversion
+        nat_gas_kbtu, nat_gas_cur = benefits['natural_gas']
+        nat_gas_kwh = nat_gas_kbtu * WATTS_PER_BTU
+        benefits['natural_gas'] = (nat_gas_kwh, nat_gas_cur)
 
-        for group, (unit, keys) in groups.iteritems():
-            valuetotal = currencytotal = 0
+    rslt = {}
 
-            for key in keys:
-                value, currency = benefits.get(key, (0, 0))
+    for group, (unit, keys) in groups.iteritems():
+        valuetotal = currencytotal = 0
 
-                valuetotal += value
-                currencytotal += currency
+        for key in keys:
+            value, currency = benefits.get(key, (0, 0))
 
-            if currencytotal == 0:
-                currencytotal = None
+            valuetotal += value
+            currencytotal += currency
 
-            rslt[group] = {'value': valuetotal,
-                           'currency': currencytotal,
-                           'unit': unit,
-                           'unit-name': 'eco',
-                           'label': benefit_labels[group]}
+        if currencytotal == 0:
+            currencytotal = None
 
-        return {'plot': rslt}
+        rslt[group] = {'value': valuetotal,
+                       'currency': currencytotal,
+                       'unit': unit,
+                       'unit-name': 'eco',
+                       'label': benefit_labels[group]}
+
+    return {'plot': rslt}
 
 
 #TODO: Does this helper exist?
@@ -324,8 +346,9 @@ def _sum_dict(d1, d2):
 
 def _benefits_for_class(cls, filter):
     benefits_fn = cls.benefits.benefits_for_filter
+    compute_benefits = lambda: benefits_fn(filter.instance, filter)
 
-    return benefits_fn(filter.instance, filter)
+    return get_cached_benefits(cls.__name__, filter, compute_benefits)
 
 
 def _combine_benefit_basis(basis, new_basis_groups):
@@ -386,7 +409,7 @@ def get_benefits_for_filter(filter):
     benefits, basis = {}, {}
 
     for C in MapFeature.subclass_dict().values():
-        if not hasattr(C, 'benefits') or C.__name__ not in allowed_types:
+        if C.__name__ not in allowed_types:
             continue
 
         ft_benefit_groups, ft_basis = _benefits_for_class(C, filter)

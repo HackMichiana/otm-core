@@ -26,7 +26,7 @@ from treemap.species.codes import ITREE_REGIONS, get_itree_code
 from treemap.audit import Auditable, Role, Dictable, Audit, PendingAuditable
 # Import this even though it's not referenced, so Django can find it
 from treemap.audit import FieldPermission  # NOQA
-from treemap.util import leaf_subclasses, to_object_name
+from treemap.util import leaf_models_of_class, to_object_name
 from treemap.decorators import classproperty
 from treemap.images import save_uploaded_image
 from treemap.units import Convertible
@@ -415,32 +415,50 @@ class Species(UDFModel, PendingAuditable):
     """
     http://plants.usda.gov/adv_search.html
     """
+
+    DEFAULT_MAX_DIAMETER = 200
+    DEFAULT_MAX_HEIGHT = 800
+
     ### Base required info
     instance = models.ForeignKey(Instance)
     # ``otm_code`` is the key used to link this instance
     # species row to a cannonical species. An otm_code
     # is usually the USDA code, but this is not guaranteed.
     otm_code = models.CharField(max_length=255)
-    common_name = models.CharField(max_length=255)
-    genus = models.CharField(max_length=255)
-    species = models.CharField(max_length=255, blank=True)
-    cultivar = models.CharField(max_length=255, blank=True)
-    other_part_of_name = models.CharField(max_length=255, blank=True)
+    common_name = models.CharField(max_length=255, verbose_name='Common Name')
+    genus = models.CharField(max_length=255, verbose_name='Genus')
+    species = models.CharField(max_length=255, blank=True,
+                               verbose_name='Species')
+    cultivar = models.CharField(max_length=255, blank=True,
+                                verbose_name='Cultivar')
+    other_part_of_name = models.CharField(max_length=255, blank=True,
+                                          verbose_name='Other Part of Name')
 
     ### From original OTM (some renamed) ###
-    is_native = models.NullBooleanField()
-    flowering_period = models.CharField(max_length=255, blank=True)
-    fruit_or_nut_period = models.CharField(max_length=255, blank=True)
-    fall_conspicuous = models.NullBooleanField()
-    flower_conspicuous = models.NullBooleanField()
-    palatable_human = models.NullBooleanField()
-    has_wildlife_value = models.NullBooleanField()
-    fact_sheet_url = models.URLField(max_length=255, blank=True)
-    plant_guide_url = models.URLField(max_length=255, blank=True)
+    is_native = models.NullBooleanField(verbose_name='Native to Region')
+    flowering_period = models.CharField(max_length=255, blank=True,
+                                        verbose_name='Flowering Period')
+    fruit_or_nut_period = models.CharField(max_length=255, blank=True,
+                                           verbose_name='Fruit or Nut Period')
+    fall_conspicuous = models.NullBooleanField(verbose_name='Fall Conspicuous')
+    flower_conspicuous = models.NullBooleanField(
+        verbose_name='Flower Conspicuous')
+    palatable_human = models.NullBooleanField(verbose_name='Edible')
+    has_wildlife_value = models.NullBooleanField(
+        verbose_name='Has Wildlife Value')
+    fact_sheet_url = models.URLField(max_length=255, blank=True,
+                                     verbose_name='Fact Sheet URL')
+    plant_guide_url = models.URLField(max_length=255, blank=True,
+                                      verbose_name='Plant Guide URL')
 
     ### Used for validation
-    max_diameter = models.IntegerField(default=200)
-    max_height = models.IntegerField(default=800)
+    max_diameter = models.IntegerField(default=DEFAULT_MAX_DIAMETER,
+                                       verbose_name='Max Diameter')
+    max_height = models.IntegerField(default=DEFAULT_MAX_HEIGHT,
+                                     verbose_name='Max Height')
+
+    updated_at = models.DateTimeField(  # TODO: remove null=True
+        null=True, auto_now=True, editable=False, db_index=True)
 
     objects = GeoHStoreUDFManager()
 
@@ -471,9 +489,9 @@ class Species(UDFModel, PendingAuditable):
 
     def get_itree_code(self, region_code=None):
         if not region_code:
-            region_codes = self.instance.itree_region_codes()
-            if len(region_codes) == 1:
-                region_code = region_codes[0]
+            regions = self.instance.itree_regions()
+            if len(regions) == 1:
+                region_code = regions[0].code
             else:
                 return None
         override = ITreeCodeOverride.objects.filter(
@@ -489,6 +507,7 @@ class Species(UDFModel, PendingAuditable):
         return self.display_name
 
     class Meta:
+        verbose_name = "Species"
         verbose_name_plural = "Species"
         unique_together = ('instance', 'common_name', 'genus', 'species',
                            'cultivar', 'other_part_of_name',)
@@ -500,6 +519,11 @@ class InstanceUser(Auditable, models.Model):
     role = models.ForeignKey(Role)
     reputation = models.IntegerField(default=0)
     admin = models.BooleanField(default=False)
+    last_seen = models.DateField(null=True, blank=True)
+
+    def __init__(self, *args, **kwargs):
+        super(InstanceUser, self).__init__(*args, **kwargs)
+        self._do_not_track.add('last_seen')
 
     class Meta:
         unique_together = ('instance', 'user',)
@@ -524,9 +548,12 @@ class MapFeature(Convertible, UDFModel, PendingAuditable):
     instance = models.ForeignKey(Instance)
     geom = models.PointField(srid=3857, db_column='the_geom_webmercator')
 
-    address_street = models.CharField(max_length=255, blank=True, null=True)
-    address_city = models.CharField(max_length=255, blank=True, null=True)
-    address_zip = models.CharField(max_length=30, blank=True, null=True)
+    address_street = models.CharField(max_length=255, blank=True, null=True,
+                                      verbose_name=_("Address"))
+    address_city = models.CharField(max_length=255, blank=True, null=True,
+                                    verbose_name=_("City"))
+    address_zip = models.CharField(max_length=30, blank=True, null=True,
+                                   verbose_name=_("Postal Code"))
 
     readonly = models.BooleanField(default=False)
 
@@ -534,15 +561,17 @@ class MapFeature(Convertible, UDFModel, PendingAuditable):
     # table, we store a "cached" value here to keep filtering easy and
     # efficient.
     updated_at = models.DateTimeField(default=timezone.now,
-                                      help_text=_("Last Updated"))
+                                      verbose_name=_("Last Updated"))
 
     # Tells the permission system that if any other field is writable,
     # updated_at is also writable
-    joint_writable = {'updated_at'}
+    joint_writable = {'updated_at', 'hide_at_zoom'}
 
     objects = GeoHStoreUDFManager()
 
-    area_field_name = None  # subclass responsibility
+    # subclass responsibilities
+    area_field_name = None
+    is_editable = None
 
     # When querying MapFeatures (as opposed to querying a subclass like Plot),
     # we get a heterogenous collection (some Plots, some RainBarrels, etc.).
@@ -550,12 +579,16 @@ class MapFeature(Convertible, UDFModel, PendingAuditable):
 
     feature_type = models.CharField(max_length=255)
 
+    hide_at_zoom = models.IntegerField(
+        null=True, blank=True, default=None, db_index=True)
+
     def __init__(self, *args, **kwargs):
         super(MapFeature, self).__init__(*args, **kwargs)
         if self.feature_type == '':
             self.feature_type = self.map_feature_type
         self._do_not_track.add('feature_type')
         self._do_not_track.add('mapfeature_ptr')
+        self._do_not_track.add('hide_at_zoom')
         self.populate_previous_state()
 
     @property
@@ -594,16 +627,19 @@ class MapFeature(Convertible, UDFModel, PendingAuditable):
     def clean(self):
         super(MapFeature, self).clean()
 
-        if not self.instance.bounds.contains(self.geom):
+        if self.geom is None:
+            raise ValidationError({
+                "geom": [_("Feature location is not specified")]})
+        if not self.instance.bounds.geom.contains(self.geom):
             raise ValidationError({
                 "geom": [
                     _(
-                        "%(model)ss must be created inside the map boundaries")
-                    % {'model': self.display_name}]
+                        "%(model)s must be created inside the map boundaries")
+                    % {'model': self.terminology(self.instance)['plural']}]
             })
 
     def delete_with_user(self, user, *args, **kwargs):
-        self.instance.update_geo_rev()
+        self.instance.update_revs('geo_rev', 'eco_rev', 'universal_rev')
         super(MapFeature, self).delete_with_user(user, *args, **kwargs)
 
     def photos(self):
@@ -623,14 +659,10 @@ class MapFeature(Convertible, UDFModel, PendingAuditable):
         # be changed for a subclass once objects have been saved.)
         return cls.__name__
 
-    @classproperty
-    def display_name(cls):
-        # Subclasses should override with something useful
-        return cls.map_feature_type
-
     @classmethod
     def subclass_dict(cls):
-        return {C.map_feature_type: C for C in leaf_subclasses(MapFeature)}
+        return {C.map_feature_type: C
+                for C in leaf_models_of_class(MapFeature)}
 
     @classmethod
     def has_subclass(cls, type):
@@ -642,13 +674,6 @@ class MapFeature(Convertible, UDFModel, PendingAuditable):
             return cls.subclass_dict()[type]
         except KeyError as e:
             raise ValidationError('Map feature type %s not found' % e)
-
-    @classmethod
-    def create(cls, type, instance):
-        """
-        Create a map feature with the given type string (e.g. 'Plot')
-        """
-        return cls.get_subclass(type)(instance=instance)
 
     @property
     def address_full(self):
@@ -684,12 +709,65 @@ class MapFeature(Convertible, UDFModel, PendingAuditable):
 
         return hashlib.md5(string_to_hash).hexdigest()
 
+    def title(self):
+        # Cast allows the map feature subclass to handle generating
+        # the display name
+        feature = self.cast_to_subtype()
+
+        if feature.is_plot:
+            tree = feature.current_tree()
+            if tree:
+                if tree.species:
+                    title = tree.species.common_name
+                else:
+                    title = _("Missing Species")
+            else:
+                title = _("Empty Planting Site")
+        else:
+            title = feature.display_name(self.instance)
+
+        return title
+
+    def contained_plots(self):
+        if self.area_field_name is not None:
+            plots = Plot.objects \
+                .filter(instance=self.instance) \
+                .filter(geom__within=getattr(self, self.area_field_name)) \
+                .prefetch_related('tree_set', 'tree_set__species')
+
+            def key_sort(plot):
+                tree = plot.current_tree()
+                if tree is None:
+                    return (0, None)
+                if tree.species is None:
+                    return (1, None)
+                return (2, tree.species.common_name)
+
+            return sorted(plots, key=key_sort)
+
+        return None
+
     def cast_to_subtype(self):
         """
         Return the concrete subclass instance. For example, if self is
         a MapFeature with subtype Plot, return self.plot
         """
-        return getattr(self, self.feature_type.lower())
+        if type(self) is not MapFeature:
+            # This shouldn't really ever happen, but there's no point trying to
+            # cast a subclass to itself
+            return self
+
+        ft = self.feature_type
+        if hasattr(self, ft.lower()):
+            return getattr(self, ft.lower())
+        else:
+            return getattr(self.polygonalmapfeature, ft.lower())
+
+    def safe_get_current_tree(self):
+        if hasattr(self, 'current_tree'):
+            return self.current_tree()
+        else:
+            return None
 
     def __unicode__(self):
         x = self.geom.x if self.geom else "?"
@@ -698,21 +776,97 @@ class MapFeature(Convertible, UDFModel, PendingAuditable):
         text = "%s (%s, %s) %s" % (self.feature_type, x, y, address)
         return text
 
+    @classproperty
+    def _terminology(cls):
+        return {'singular': cls.__name__}
 
-#TODO:
+    @classproperty
+    def benefits(cls):
+        from treemap.ecobenefits import CountOnlyBenefitCalculator
+        return CountOnlyBenefitCalculator(cls)
+
+    @property
+    def itree_region(self):
+        regions = self.instance.itree_regions(geometry__contains=self.geom)
+        if regions:
+            return regions[0]
+        else:
+            return ITreeRegionInMemory(None)
+
+
+class ValidationMixin(object):
+    def validate_positive_nullable_float_field(self, field_name,
+                                               max_value=None):
+        if getattr(self, field_name) is not None:
+            pretty_field_name = field_name.replace('_', ' ')
+            try:
+                # The value could be a string at this point so we
+                # cast to make sure that we are comparing two numeric
+                # values
+                new_value = float(getattr(self, field_name))
+            except ValueError:
+                raise ValidationError({field_name: [
+                    _('The %(field_name)s must be a decimal number' %
+                      {'field_name': pretty_field_name})]})
+
+            if new_value <= 0:
+                raise ValidationError({field_name: [
+                    _('The %(field_name)s must be greater than zero' %
+                      {'field_name': pretty_field_name})]})
+
+            if max_value is not None:
+                if new_value > max_value:
+                    raise ValidationError({field_name: [
+                        _('The %(field_name)s is too large' %
+                          {'field_name': pretty_field_name})]})
+
+
+# TODO:
 # Exclusion Zones
 # Proximity validation
 # UDFModel overrides implementations of methods in
 # authorizable and auditable, thus needs to be inherited first
-class Plot(MapFeature):
+class Plot(MapFeature, ValidationMixin):
     width = models.FloatField(null=True, blank=True,
-                              help_text=_("Plot Width"))
+                              verbose_name=_("Planting Site Width"))
     length = models.FloatField(null=True, blank=True,
-                               help_text=_("Plot Length"))
+                               verbose_name=_("Planting Site Length"))
 
     owner_orig_id = models.CharField(max_length=255, null=True, blank=True)
 
     objects = GeoHStoreUDFManager()
+    is_editable = True
+
+    _terminology = {'singular': _('Planting Site'),
+                    'plural': _('Planting Sites')}
+
+    udf_settings = {
+        'Stewardship': {
+            'iscollection': True,
+            'range_field_key': 'Date',
+            'action_field_key': 'Action',
+            'action_verb': _('that have been'),
+            'defaults': [
+                {'name': 'Action',
+                 'choices': ['Enlarged',
+                             'Changed to Include a Guard',
+                             'Changed to Remove a Guard',
+                             'Filled with Herbaceous Plantings'],
+                 'type': 'choice'},
+                {'type': 'date',
+                 'name': 'Date'}],
+        },
+        'Alerts': {
+            'iscollection': True,
+            'warning_message': _(
+                "Marking a planting site with an alert does not serve as a "
+                "way to report problems with that site. If you have any "
+                "emergency concerns, please contact your city directly."),
+            'range_field_key': 'Date Noticed',
+            'action_field_key': 'Action Needed',
+            'action_verb': _('with open alerts for'),
+        }
+    }
 
     @classproperty
     def benefits(cls):
@@ -755,41 +909,79 @@ class Plot(MapFeature):
         else:
             return None
 
+    def save_with_user(self, user, *args, **kwargs):
+        self.full_clean_with_user(user)
+
+        # These validations must be done after the field values have
+        # been converted to database units but `convert_to_database_units`
+        # calls `clean`, so these validations cannot be part of `clean`.
+        self.validate_positive_nullable_float_field('width')
+        self.validate_positive_nullable_float_field('length')
+
+        super(Plot, self).save_with_user(user, *args, **kwargs)
+
     def delete_with_user(self, user, cascade=False, *args, **kwargs):
         if self.current_tree() and cascade is False:
             raise ValidationError(_(
                 "Cannot delete plot with existing trees."))
         super(Plot, self).delete_with_user(user, *args, **kwargs)
 
-    @classproperty
-    def display_name(cls):
-        return _('Planting Site')
-
 
 # UDFModel overrides implementations of methods in
 # authorizable and auditable, thus needs to be inherited first
-class Tree(Convertible, UDFModel, PendingAuditable):
+class Tree(Convertible, UDFModel, PendingAuditable, ValidationMixin):
     """
     Represents a single tree, belonging to an instance
     """
     instance = models.ForeignKey(Instance)
 
     plot = models.ForeignKey(Plot)
-    species = models.ForeignKey(Species, null=True, blank=True)
+    species = models.ForeignKey(Species, null=True, blank=True,
+                                verbose_name=_("Species"))
 
     readonly = models.BooleanField(default=False)
     diameter = models.FloatField(null=True, blank=True,
-                                 help_text=_("Tree Diameter"))
+                                 verbose_name=_("Tree Diameter"))
     height = models.FloatField(null=True, blank=True,
-                               help_text=_("Tree Height"))
+                               verbose_name=_("Tree Height"))
     canopy_height = models.FloatField(null=True, blank=True,
-                                      help_text=_("Canopy Height"))
+                                      verbose_name=_("Canopy Height"))
     date_planted = models.DateField(null=True, blank=True,
-                                    help_text=_("Date Planted"))
+                                    verbose_name=_("Date Planted"))
     date_removed = models.DateField(null=True, blank=True,
-                                    help_text=_("Date Removed"))
+                                    verbose_name=_("Date Removed"))
 
     objects = GeoHStoreUDFManager()
+
+    _stewardship_choices = ['Watered',
+                            'Pruned',
+                            'Mulched, Had Compost Added, or Soil Amended',
+                            'Cleared of Trash or Debris']
+
+    udf_settings = {
+        'Stewardship': {
+            'iscollection': True,
+            'range_field_key': 'Date',
+            'action_field_key': 'Action',
+            'action_verb': 'that have been',
+            'defaults': [
+                {'name': 'Action',
+                 'choices': _stewardship_choices,
+                 'type': 'choice'},
+                {'type': 'date',
+                 'name': 'Date'}],
+        },
+        'Alerts': {
+            'iscollection': True,
+            'warning_message': _(
+                "Marking a tree with an alert does not serve as a way to "
+                "report problems with a tree. If you have any emergency "
+                "tree concerns, please contact your city directly."),
+            'range_field_key': 'Date Noticed',
+            'action_field_key': 'Action Needed',
+            'action_verb': _('with open alerts for'),
+        }
+    }
 
     def __unicode__(self):
         diameter_chunk = ("Diameter: %s, " % self.diameter
@@ -797,6 +989,8 @@ class Tree(Convertible, UDFModel, PendingAuditable):
         species_chunk = ("Species: %s - " % self.species
                          if self.species else "")
         return "%s%s" % (diameter_chunk, species_chunk)
+
+    _terminology = {'singular': _('Tree'), 'plural': _('Trees')}
 
     def dict(self):
         props = self.as_dict()
@@ -808,23 +1002,29 @@ class Tree(Convertible, UDFModel, PendingAuditable):
         return self.treephoto_set.order_by('-created_at')
 
     @property
-    def itree_region(self):
-        if self.instance.itree_region_default:
-            region = self.instance.itree_region_default
-        else:
-            regions = ITreeRegion.objects\
-                                 .filter(geometry__contains=self.plot.geom)
-
-            if len(regions) > 0:
-                region = regions[0].code
-            else:
-                region = None
-
-        return region
+    def itree_code(self):
+        return self.species.get_itree_code(self.plot.itree_region.code)
 
     ##########################
     # tree validation
     ##########################
+
+    def validate_diameter(self):
+        if self.species:
+            max_value = self.species.max_diameter
+        else:
+            max_value = Species.DEFAULT_MAX_DIAMETER
+        self.validate_positive_nullable_float_field('diameter', max_value)
+
+    def validate_height(self):
+        if self.species:
+            max_value = self.species.max_height
+        else:
+            max_value = Species.DEFAULT_MAX_HEIGHT
+        self.validate_positive_nullable_float_field('height', max_value)
+
+    def validate_canopy_height(self):
+        self.validate_positive_nullable_float_field('canopy_height')
 
     def clean(self):
         super(Tree, self).clean()
@@ -833,6 +1033,14 @@ class Tree(Convertible, UDFModel, PendingAuditable):
 
     def save_with_user(self, user, *args, **kwargs):
         self.full_clean_with_user(user)
+
+        # These validations must be done after the field values have
+        # been converted to database units but `convert_to_database_units`
+        # calls `clean`, so these validations cannot be part of `clean`.
+        self.validate_diameter()
+        self.validate_height()
+        self.validate_canopy_height()
+
         self.plot.update_updated_at()
         super(Tree, self).save_with_user(user, *args, **kwargs)
 
@@ -869,6 +1077,7 @@ class Tree(Convertible, UDFModel, PendingAuditable):
         for photo in photos:
             photo.delete_with_user(user)
         self.plot.update_updated_at()
+        self.instance.update_universal_rev()
         super(Tree, self).delete_with_user(user, *args, **kwargs)
 
 
@@ -881,7 +1090,7 @@ class Favorite(models.Model):
         unique_together = ('user', 'map_feature',)
 
 
-class MapFeaturePhoto(models.Model, PendingAuditable):
+class MapFeaturePhoto(models.Model, PendingAuditable, Convertible):
     map_feature = models.ForeignKey(MapFeature)
 
     image = models.ImageField(
@@ -891,6 +1100,8 @@ class MapFeaturePhoto(models.Model, PendingAuditable):
 
     created_at = models.DateTimeField(auto_now_add=True)
     instance = models.ForeignKey(Instance)
+
+    _terminology = {'singular': _('Photo'), 'plural': _('Photos')}
 
     def __init__(self, *args, **kwargs):
         super(MapFeaturePhoto, self).__init__(*args, **kwargs)
@@ -1015,13 +1226,36 @@ class Boundary(models.Model):
     category = models.CharField(max_length=255)
     sort_order = models.IntegerField()
 
+    updated_at = models.DateTimeField(  # TODO: remove null=True
+        null=True, auto_now=True, editable=False, db_index=True)
+
     objects = models.GeoManager()
 
     def __unicode__(self):
         return self.name
 
 
-class ITreeRegion(models.Model):
+class ITreeRegionAbstract(object):
+    def __unicode__(self):
+        "printed representation, used in templates"
+        return "%s (%s)" % (self.code,
+                            ITREE_REGIONS.get(self.code, {}).get('name'))
+
+
+class ITreeRegionInMemory(ITreeRegionAbstract):
+    """
+    class for in-memory itree region objects
+
+    since we store an itree default code as a charfield and not a
+    foreign key on instance, it is helpful to be able to inflate it
+    into an ITreeRegion-like object and use it with the same interface
+    as objects that come out of the database.
+    """
+    def __init__(self, code):
+        self.code = code
+
+
+class ITreeRegion(ITreeRegionAbstract, models.Model):
     code = models.CharField(max_length=40, unique=True)
     geometry = models.MultiPolygonField(srid=3857)
 

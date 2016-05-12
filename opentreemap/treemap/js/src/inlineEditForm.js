@@ -6,55 +6,46 @@ var $ = require('jquery'),
     BU = require('treemap/baconUtils'),
     U = require('treemap/utility'),
     _ = require('lodash'),
-    moment = require('moment'),
     FH = require('treemap/fieldHelpers'),
-    getDatum = require('treemap/otmTypeahead').getDatum,
     console = require('console-browserify'),
+    editableForm = require('treemap/editableForm'),
 
-    eventsLandingInEditMode = ['edit:start', 'save:start', 'save:error'],
+    eventsLandingInEditMode = [editableForm.editStartAction, 'save:start', 'save:error'],
     eventsLandingInDisplayMode = ['idle', 'save:ok', 'cancel'];
-
-// Placed onto the jquery object
-require('bootstrap-datepicker');
-
-// Boolean fields values are provided as "True" and "False"
-// from the server-side template tags as well as in this module.
-// In order to provide custom values for these fields, this function
-// can be run after writing a value to the boolean field, it will
-// comb through the provided data attributes to see if custom text
-// is provided.
-//
-// To make a field/element function with customizable boolean labels:
-// * specify the data-bool-true-text attribute on the element
-// * specify the data-bool-false-text attribute on the element
-function getBooleanFieldText (boolField, boolText) {
-    var $boolField = $(boolField),
-        attributes = {True: 'data-bool-true-text',
-                      False: 'data-bool-false-text'},
-        attribute = attributes[boolText];
-
-    // .is() is the recommended way of doing 'hasattr'
-    return $boolField.is("[" + attribute + "]") ?
-        $boolField.attr(attribute) : boolText;
-}
 
 exports.init = function(options) {
     var updateUrl = options.updateUrl,
-        form = options.form,
-        $edit = $(options.edit),
-        $save = $(options.save),
-        $cancel = $(options.cancel),
-        displayFields = options.displayFields,
-        editFields = options.editFields,
+        section = options.section || 'body',
+        form = options.form || section + ' form',
+        $section = $(section),
+        $edit = options.edit ? $(options.edit) : $section.find('.editBtn'),
+        $save = options.save ? $(options.save) : $section.find('.saveBtn'),
+        $cancel = options.cancel ? $(options.cancel) : $section.find('.cancelBtn'),
+        $spinner = options.spinner ? $(options.spinner) : $section.find('.spinner'),
+        displayFields = options.displayFields || section + ' [data-class="display"]',
+        editFields = options.editFields || section + ' [data-class="edit"]',
+        validationFields = options.validationFields || section + ' [data-class="error"]',
         globalErrorSection = options.globalErrorSection,
-        validationFields = options.validationFields,
         errorCallback = options.errorCallback || $.noop,
-        onSaveBefore = options.onSaveBefore || _.identity,
-        editStream = $edit.asEventStream('click').map('edit:start'),
-        saveStream = (options.saveStream || $save.asEventStream('click')).map('save:start'),
+        onSaveAfter = options.onSaveAfter || _.identity,
+
+        showSavePending = function (saveIsPending) {
+            $spinner.toggle(saveIsPending);
+            $save.prop('disabled', saveIsPending);
+            $cancel.prop('disabled', saveIsPending);
+        },
+
+        editStream = $edit.asEventStream('click').map(editableForm.editStartAction),
+        saveStream = (options.saveStream || $save.asEventStream('click'))
+            .doAction(showSavePending, true)
+            .map('save:start'),
         externalCancelStream = BU.triggeredObjectStream('cancel'),
         cancelStream = $cancel.asEventStream('click').map('cancel'),
+        globalCancelStream = cancelStream.merge(externalCancelStream),
+
         actionStream = new Bacon.Bus(),
+
+        editForm = editableForm.init(options),
 
         logError = function(error) {
             console.error("Error uploading to " + updateUrl, error);
@@ -99,101 +90,6 @@ exports.init = function(options) {
             $("table[data-udf-id] .placeholder").css('display', 'none');
         },
 
-        displayValuesToTypeahead = function() {
-            $('[data-typeahead-restore]').each(function(index, el) {
-                var field = $(el).attr('data-typeahead-restore');
-                if (field) {
-                    $('input[name="' + field + '"]').trigger('restore', $(el).val());
-                }
-            });
-        },
-
-        displayValuesToFormFields = function() {
-            $(displayFields).each(function(index, el) {
-                var $el = $(el),
-                    field = $el.attr('data-field'),
-                    value = $el.attr('data-value'),
-                    $input;
-
-                if (field && $el.is('[data-value]')) {
-                    $input = FH.getSerializableField($(editFields), field);
-                    if ($input.is('[type="checkbox"]')) {
-                        $input.prop('checked', value == "True");
-                    }
-                    else if ($input.is('[data-date-format]')) {
-                        FH.applyDateToDatepicker($input, value);
-                    } else {
-                        $input.val(value);
-                    }
-                }
-            });
-            displayValuesToTypeahead();
-        },
-
-        typeaheadToDisplayValues = function() {
-            $('[data-typeahead-input]').each(function(index, el) {
-                var datum = getDatum($(el)),
-                    field = $(el).attr('data-typeahead-input');
-                if (typeof datum != "undefined") {
-                    $('[data-typeahead-restore="' + field + '"]').each(function(index, el) {
-                        $(el).val(datum[$(el).attr('data-datum')]);
-                    });
-                    $('[data-typeahead="' + field + '"]').each(function(index, el) {
-                        $(el).html(datum[$(el).attr('data-datum')]);
-                    });
-                }
-            });
-        },
-
-        formFieldsToDisplayValues = function() {
-            $(editFields).each(function(index, el){
-                var field = $(el).attr('data-field'),
-                    $input, value, display, digits, units,
-                    displayValue;
-
-                // if the edit field has a data-field property,
-                // look for a corresponding display value and if
-                // found, populate the display value
-                if ($(el).is('[data-field]')) {
-                    display = FH.getField($(displayFields), field);
-
-                    if ($(display).is('[data-value]')) {
-                        $input = FH.getSerializableField($(editFields), field);
-                        if ($input.is('[type="checkbox"]')) {
-                            value = $input.is(':checked') ? "True" : "False";
-                        } else if ($input.is('[data-date-format]')) {
-                            value = FH.getTimestampFromDatepicker($input);
-                        } else {
-                            value = $input.val();
-                        }
-
-                        $(display).attr('data-value', value);
-                        displayValue = value;
-
-                        if ($input.is('select')) {
-                            // Use dropdown text (not value) as display value
-                            displayValue = $input.find('option:selected').text();
-                        } else if ($input.is('[type="checkbox"]')) {
-                            displayValue = getBooleanFieldText(display, value);
-                        } else if (value && $input.is('[data-date-format]')) {
-                            displayValue = $input.val();
-                        } else if (value) {
-                            digits = $(display).data('digits');
-                            if (digits) {
-                                displayValue = parseFloat(value).toFixed(digits);
-                            }
-                            units = $(display).data('units');
-                            if (units) {
-                                displayValue = value + ' ' + units;
-                            }
-                        }
-                        $(display).text(displayValue);
-                    }
-                }
-            });
-            typeaheadToDisplayValues();
-        },
-
         getDataToSave = function() {
             var data = FH.formToDictionary($(form), $(editFields), $(displayFields));
 
@@ -227,17 +123,7 @@ exports.init = function(options) {
                     });
             });
 
-            onSaveBefore(data);
             return data;
-        },
-
-        update = function(data) {
-            return Bacon.fromPromise($.ajax({
-                url: updateUrl,
-                type: 'PUT',
-                contentType: "application/json",
-                data: JSON.stringify(data)
-            }));
         },
 
         showGlobalErrors = function (errors) {
@@ -245,6 +131,7 @@ exports.init = function(options) {
 
             if ($globalErrorSection.length > 0) {
                 $globalErrorSection.html(errors.join(','));
+                $globalErrorSection.show();
             } else {
                 console.log('Global error returned from server, ' +
                             'but no dom element bound from client.',
@@ -253,7 +140,7 @@ exports.init = function(options) {
         },
 
         showValidationErrorsInline = function (errors) {
-            $(validationFields).each(function() {
+            $(validationFields).not(globalErrorSection).each(function() {
                 $(this).html('');
             });
             _.each(errors, function (errorList, fieldName) {
@@ -261,6 +148,7 @@ exports.init = function(options) {
 
                 if ($field.length > 0) {
                     $field.html(errorList.join(','));
+                    $field.show();
                 } else {
                     console.log('Field error returned from server, ' +
                                 'but no dom element bound from client.',
@@ -275,11 +163,49 @@ exports.init = function(options) {
 
         responseStream = saveStream
             .map(getDataToSave)
-            .flatMap(update),
+            .flatMapLatest(function (data) {
+                // onSaveBefore is a function that takes form data
+                // and carries out arbitrary, potentially blocking
+                // actions before allowing the save process to
+                // continue.
+                //
+                // the return value of an onSaveBefore callback can be:
+                // * null - for non-blocking side effects and mutation
+                //          of the data object
+                // * an eventStream - for blocking side effects,
+                //                    failure cases and early exits.
+                //
+                // when providing an eventStream as the return value for
+                // onSaveBefore, it should meet the following criteria:
+                // * it should be a stream of data objects. If you are using
+                //   eventStreams to block on IO, map them to the `data`
+                //   object provided.
+                // * it should pust a new stream value when it's ok to
+                //   proceed and block until then. There is no concept
+                //   of exiting, just failing to stop blocking.
+                var result = options.onSaveBefore ?
+                        options.onSaveBefore(data) : null;
+                if (_.isNull(result) || _.isUndefined(result)) {
+                    return Bacon.once(data);
+                } else if (_.isObject(result) && result.hasOwnProperty('takeUntil')) {
+                    return result;
+                } else {
+                    throw "onSaveBefore returned something other than a stream or null";
+                }
+            })
+            .flatMap(function(data) {
+                return Bacon.fromPromise($.ajax({
+                    url: updateUrl,
+                    type: 'PUT',
+                    contentType: "application/json",
+                    data: JSON.stringify(data)
+                }));
+            }),
 
         responseErrorStream = responseStream
             .errors()
             .mapError(function (e) {
+                showSavePending(false);
                 var result = ('responseJSON' in e) ? e.responseJSON : {};
                 if ('error' in result) {
                     U.warnDeprecatedErrorMessage(result);
@@ -295,38 +221,12 @@ exports.init = function(options) {
             }),
 
         saveOkStream = responseStream.map(function(responseData) {
+            showSavePending(false);
             return {
                 formData: getDataToSave(),
                 responseData: responseData
             };
         }),
-
-        hideAndShowElements = function (fields, actions, action) {
-            if (_.contains(actions, action)) {
-                $(fields).show();
-            } else {
-                if (action === 'edit:start') {
-                    // always hide the applicable runmode buttons
-                    $(fields).filter('.btn').hide();
-
-                    // hide the display fields if there is a corresponding
-                    // edit field to show in its place
-                    _.each($(fields).filter(":not(.btn)"), function (field) {
-                        var $field = $(field),
-                            $edit = FH.getField($(editFields),
-                                                $field.attr('data-field'));
-
-                        if ($edit.length === 1) {
-                            $field.hide();
-                        }
-
-                    });
-
-                } else {
-                    $(fields).hide();
-                }
-            }
-        },
 
         validationErrorsStream = responseErrorStream
             .filter('.fieldErrors')
@@ -345,7 +245,9 @@ exports.init = function(options) {
 
         inEditModeProperty = actionStream.map(function (event) {
             return _.contains(eventsLandingInEditMode, event);
-        }).toProperty(),
+        })
+            .toProperty()
+            .skipDuplicates(),
 
         saveOKFormDataStream = saveOkStream.map('.formData'),
 
@@ -357,8 +259,6 @@ exports.init = function(options) {
             .map(function(isInEdit) {
                 return isInEdit ? 'edit:start' : 'cancel';
             });
-
-    $(editFields).find("input[data-date-format]").datepicker();
 
     // Prevent default form submission from clicking on buttons or pressing
     // enter. Event is delegated on window since sometimes <form>s are inserted
@@ -374,11 +274,15 @@ exports.init = function(options) {
     actionStream.plug(saveOkStream.map('save:ok'));
     actionStream.plug(responseErrorStream.map('save:error'));
     actionStream.plug(modeChangeStream);
-    actionStream.onValue(hideAndShowElements, editFields, eventsLandingInEditMode);
-    actionStream.onValue(hideAndShowElements, displayFields, eventsLandingInDisplayMode);
-    actionStream.onValue(hideAndShowElements, validationFields, ['save:error']);
+    actionStream.onValue(editForm.hideAndShowElements, editFields, eventsLandingInEditMode);
+    actionStream.onValue(editForm.hideAndShowElements, displayFields, eventsLandingInDisplayMode);
+    actionStream.onValue(editForm.hideAndShowElements, validationFields, ['save:error']);
 
-    saveOKFormDataStream.onValue(formFieldsToDisplayValues);
+    responseStream.onValue(onSaveAfter);
+
+    globalCancelStream.onValue(showSavePending, false);
+
+    saveOKFormDataStream.onValue(editForm.formFieldsToDisplayValues);
 
     globalErrorsStream.onValue(showGlobalErrors);
     validationErrorsStream.onValue(showValidationErrorsInline);
@@ -386,7 +290,7 @@ exports.init = function(options) {
     unhandledErrorStream.onValue(errorCallback);
     unhandledErrorStream.onValue(logError);
 
-    editStartStream.onValue(displayValuesToFormFields);
+    editStartStream.onValue(editForm.displayValuesToFormFields);
     editStartStream.onValue(showCollectionUdfs);
 
     eventsLandingInDisplayModeStream.onValue(resetCollectionUdfs);
@@ -396,8 +300,13 @@ exports.init = function(options) {
         actionStream: actionStream.map(_.identity),
         cancel: externalCancelStream.trigger,
         saveOkStream: saveOkStream,
+        // TODO: audit all uses of cancelStream, external cancel, and
+        // global cancel stream and merge these streams in the api
         cancelStream: cancelStream,
+        globalCancelStream: globalCancelStream,
         inEditModeProperty: inEditModeProperty,
+        showGlobalErrors: showGlobalErrors,
+        showValidationErrorsInline: showValidationErrorsInline,
         setUpdateUrl: function (url) { updateUrl = url; }
     };
 };

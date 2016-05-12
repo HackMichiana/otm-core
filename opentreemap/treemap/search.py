@@ -26,19 +26,19 @@ class ParseException (Exception):
         self.message = message
 
 
+class ModelParseException(ParseException):
+    pass
+
+
 DEFAULT_MAPPING = {'plot': '',
+                   'bioswale': '',
+                   'rainGarden': '',
+                   'rainBarrel': '',
                    'tree': 'tree__',
                    'species': 'tree__species__',
                    'treePhoto': 'tree__treephoto__',
                    'mapFeaturePhoto': 'mapfeaturephoto__',
                    'mapFeature': ''}
-
-TREE_MAPPING = {'plot': 'plot__',
-                'tree': '',
-                'species': 'species__',
-                'treePhoto': 'treephoto__',
-                'mapFeaturePhoto': 'treephoto__',
-                'mapFeature': 'plot__'}
 
 PLOT_RELATED_MODELS = {Plot, Tree, Species, TreePhoto}
 
@@ -46,8 +46,12 @@ MAP_FEATURE_RELATED_NAMES = {'mapFeature', 'mapFeaturePhoto'}
 
 
 class Filter(object):
+    def __repr__(self):
+        return "(%s, %s)" % (self.filterstr, self.displaystr)
+
     def __init__(self, filterstr, displaystr, instance):
         self.filterstr = filterstr
+        self.displaystr = displaystr
         self.display_filter = loads(displaystr) if displaystr else None
         self.instance = instance
 
@@ -55,23 +59,13 @@ class Filter(object):
         # Filter out invalid models
         model_name = ModelClass.__name__
 
-        # This is a special case when we're doing 'tree-centric'
-        # searches for eco benefits. Trees essentially count
-        # as plots for the purposes of pruning
-        if model_name == 'Tree':
-            model_name = 'Plot'
-
         if not _model_in_display_filters(model_name, self.display_filter):
             return ModelClass.objects.none()
 
-        if ModelClass == Tree:
-            mapping = TREE_MAPPING
-        else:
-            mapping = DEFAULT_MAPPING
-
-        q = create_filter(self.instance, self.filterstr, mapping)
+        q = create_filter(self.instance, self.filterstr, DEFAULT_MAPPING)
         if model_name == 'Plot':
-            q = _apply_tree_display_filter(q, self.display_filter, mapping)
+            q = _apply_tree_display_filter(q, self.display_filter,
+                                           DEFAULT_MAPPING)
 
         models = q.basekeys
 
@@ -201,7 +195,7 @@ def _parse_predicate_key(key, mapping):
         mapping_model = model
 
     if mapping_model not in mapping:
-        raise ParseException(
+        raise ModelParseException(
             'Valid models are: %s or a collection UDF, not "%s"' %
             (mapping.keys(), model))
 
@@ -218,10 +212,23 @@ def _parse_value(value):
     if type(value) is list:
         return [_parse_value(v) for v in value]
 
+    # warning: order matters here, because datetimes
+    # can actually actually parse into float values.
     try:
         return datetime.strptime(value, DATETIME_FORMAT)
     except (ValueError, TypeError):
-        return value
+        # We have do this because it is possible for postgres
+        # to interpret numeric search values as integers when
+        # they are actually being compared to hstore values stored
+        # as floats. Since django-hstore will cast the LHS to the
+        # type of the RHS, it fail to parse a string representation
+        # of a float into an integer.
+        #
+        # TODO: submit a fix to django-hstore to handle this.
+        try:
+            return float(value)
+        except ValueError:
+            return value
 
 
 def _parse_min_max_value_fn(operator):
@@ -255,9 +262,12 @@ def _parse_min_max_value_fn(operator):
             if isinstance(value, datetime):
                 date_value = value.date().isoformat()
                 inner_value = {field: date_value}
+            elif isinstance(value, float):
+                inner_value = {field: value}
             else:
-                raise ParseException("Cannot perform min/max comparisons on "
-                                     "non-date hstore fields at this time.")
+                raise ParseException(
+                    "Cannot perform min/max comparisons on "
+                    "non-date/numeric hstore fields at this time.")
         else:
             inner_value = value
 
@@ -404,7 +414,16 @@ _parse_udf_dict_value = partial(_parse_dict_value_for_mapping,
 
 
 def _parse_predicate_pair(key, value, mapping):
-    model, search_key = _parse_predicate_key(key, mapping)
+    try:
+        model, search_key = _parse_predicate_key(key, mapping)
+    except ModelParseException:
+        # currently, the only case in which a key for another model
+        # may be sent to a model search is when udfs are sent to
+        # tree search. therefore we should only allow those to pass.
+        if _is_udf(key):
+            return FilterContext(id__in=[])
+        else:
+            raise
     __, __, field = key.partition('.')
 
     if _is_udf(model) and type(value) == dict:

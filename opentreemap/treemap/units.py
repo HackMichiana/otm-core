@@ -3,6 +3,8 @@ from __future__ import print_function
 from __future__ import unicode_literals
 from __future__ import division
 
+import copy
+
 from functools import partial
 from numbers import Number
 
@@ -20,8 +22,25 @@ class Convertible(object):
         self.unit_status = 'db'
         super(Convertible, self).__init__(*args, **kwargs)
 
+    @classmethod
+    def terminology(cls, instance=None):
+        terms = copy.copy(cls._terminology)
+        if instance:
+            terms.update(instance.config
+                         .get('terms', {})
+                         .get(cls.__name__, {}))
+        return terms
+
+    @classmethod
+    def display_name(cls, instance):
+        return cls.terminology(instance)['singular']
+
     def _mutate_convertable_fields(self, f):
-        model = self._meta.object_name.lower()
+        from treemap.util import to_object_name
+        # note that `to_object_name` is a helper function we use
+        # for lowerCamelCase, but `._meta.object_name` is a django
+        # internal that is represented as UpperCamelCase.
+        model = to_object_name(self._meta.object_name)
         for field in self._meta.get_all_field_names():
             if self.instance and is_convertible(model, field):
                 value = getattr(self, field)
@@ -40,7 +59,7 @@ class Convertible(object):
         if self.unit_status != 'display':
             self.unit_status = 'display'
 
-            self._mutate_convertable_fields(get_converted_value)
+            self._mutate_convertable_fields(convert_storage_to_instance_units)
 
     def convert_to_database_units(self):
         self.clean()
@@ -164,7 +183,11 @@ is_convertible = partial(_is_configured_for, {'units'})
 is_formattable = partial(_is_configured_for, {'digits'})
 
 
-def get_conversion_factor(instance, category_name, value_name):
+def storage_to_instance_units_factor(instance, category_name, value_name):
+    """
+    Return conversion factor from OTM storage units to instance's preferred
+    units. Returned factor is the number of instance units per storage unit.
+    """
     storage_unit = _get_storage_units(category_name, value_name)
     instance_unit = get_units(instance, category_name, value_name)
     conversion_dict = _unit_conversions.get(storage_unit)
@@ -176,10 +199,14 @@ def get_conversion_factor(instance, category_name, value_name):
     return conversion_dict[instance_unit]
 
 
-def get_converted_value(instance, category_name, value_name, value):
+def convert_storage_to_instance_units(instance, category_name, value_name,
+                                      value):
+    """
+    Convert given value from storage units to instance units.
+    """
     if isinstance(value, Number) and \
        is_convertible(category_name, value_name):
-        conversion_factor = get_conversion_factor(
+        conversion_factor = storage_to_instance_units_factor(
             instance, category_name, value_name)
 
         return value * conversion_factor
@@ -187,17 +214,18 @@ def get_converted_value(instance, category_name, value_name, value):
         return value
 
 
-def get_display_value(instance, category_name, value_name, value):
+def get_display_value(instance, category_name, value_name, value, digits=None):
     if not isinstance(value, Number):
         return value, value
 
-    converted_value = get_converted_value(
+    converted_value = convert_storage_to_instance_units(
         instance, category_name, value_name, value)
 
-    if is_formattable(category_name, value_name):
-        digits = int(get_digits(instance, category_name, value_name))
-    else:
-        digits = 1
+    if digits is None:
+        if is_formattable(category_name, value_name):
+            digits = int(get_digits(instance, category_name, value_name))
+        else:
+            digits = 1
 
     rounded_value = round(converted_value, digits)
 
@@ -218,5 +246,5 @@ def format_value(instance, category_name, value_name, value):
 def get_storage_value(instance, category_name, value_name, value):
     if not isinstance(value, Number):
         return value
-    return value / get_conversion_factor(instance, category_name,
-                                         value_name)
+    return value / storage_to_instance_units_factor(instance, category_name,
+                                                    value_name)

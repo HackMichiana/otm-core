@@ -44,7 +44,7 @@ otm.settings.geocoder = {
 otm.settings.trans = {
     noStreetViewText: '{% trans "Could not load street view for this location" %}',
     treeDetails: '{% trans "Tree Details" %}',
-    resourceDetails: '{{ term.Resource }}{% trans " Details" %}',
+    resourceDetails: '{{ term.Resource.singular }}{% trans " Details" %}',
     {# this has to be broken into two sections because window.onbeforeunload has a default but confirm() does not #}
     exitWarning: '{% trans "You have begun entering data. Any unsaved changes will be lost." %}',
     exitQuestion: '{% trans "Are you sure you want to continue?" %}'
@@ -65,9 +65,12 @@ otm.settings.doubleClickInterval = '{{ settings.DOUBLE_CLICK_INTERVAL }}';
         'id': '{{ request.instance.id }}',
         'url': '{{ SITE_ROOT }}{{ request.instance.url_name }}/',
         'mapUrl': "{% url 'map' instance_url_name=last_instance.url_name %}",
+        'polygonForPointUrl': "{% url 'polygon_for_point' instance_url_name=last_instance.url_name %}",
         'addTreeUrl': "{% url 'map' instance_url_name=last_instance.url_name %}{{ settings.ADD_TREE_URL_HASH }}",
         'name': '{{ request.instance.name }}',
-        'rev': '{{ request.instance.geo_rev_hash }}',
+        'mapFeatureTypes': {{ request.instance.map_feature_types|as_json|safe }},
+        'geoRevHash': '{{ request.instance.geo_rev_hash }}',
+        'universalRevHash': '{{ request.instance.universal_rev_hash }}',
         'center': {
             'x': '{{ request.instance.center.x }}',
             'y': '{{ request.instance.center.y }}'

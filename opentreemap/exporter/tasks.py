@@ -4,9 +4,11 @@ from __future__ import unicode_literals
 from __future__ import division
 
 import csv
+import logging
 
 from contextlib import contextmanager
 from functools import wraps
+from collections import OrderedDict
 from celery import task
 from tempfile import TemporaryFile
 
@@ -14,20 +16,26 @@ from django.core.files import File
 from treemap.lib.object_caches import permissions
 
 from treemap.search import Filter
-from treemap.models import Species, Tree
+from treemap.models import Species, Plot
 from treemap.util import safe_get_model_class
 from treemap.audit import model_hasattr, FieldPermission
-from treemap.udf import UserDefinedCollectionValue, UDFC_NAMES
+from treemap.udf import UserDefinedCollectionValue
 
 from treemap.lib.object_caches import udf_defs
 
 from djqscsv import write_csv, generate_filename
-from exporter.models import ExportJob
 
+from opentreemap.util import add_rollbar_handler
+
+from exporter.models import ExportJob
 from exporter.user import write_users
 from exporter.util import sanitize_unicode_record
 
-_UDFC_FIELDS = tuple(['udf:' + name for name in UDFC_NAMES])
+from importer import fields
+
+
+logger = logging.getLogger(__name__)
+add_rollbar_handler(logger, level=logging.INFO)
 
 
 @contextmanager
@@ -49,50 +57,50 @@ def _job_transaction(fn):
     return wrapper
 
 
-def extra_select_and_values_for_model(
-        instance, job, table, model, prefix=None):
+def _values_for_model(
+        instance, job, table, model,
+        select, select_params, prefix=None):
     if prefix:
         prefix += '__'
     else:
         prefix = ''
 
-    perms = permissions(job.user, instance, model)
-
-    extra_select = {}
     prefixed_names = []
-    dummy_instance = safe_get_model_class(model)()
+    model_class = safe_get_model_class(model)
+    dummy_instance = model_class()
 
-    for perm in (perm for perm in perms
-                 if perm.permission_level >= FieldPermission.READ_ONLY):
-        field_name = perm.field_name
+    for field_name in (perm.field_name for perm
+                       in permissions(job.user, instance, model)
+                       if perm.permission_level >= FieldPermission.READ_ONLY):
         prefixed_name = prefix + field_name
 
-        if field_name in _UDFC_FIELDS:
-
-            field_definition_id = None
-            for udfd in udf_defs(instance, model):
-                if udfd.iscollection and udfd.name == field_name[4:]:
-                    field_definition_id = udfd.id
-
-            if field_definition_id is None:
-                continue
-
-            extra_select[prefixed_name] = (
-                """
-                WITH formatted_data AS (
-                    SELECT concat('(', data, ')') as fdata
-                    FROM %s
-                    WHERE field_definition_id = %s and model_id = %s.id
-                )
-
-                SELECT array_to_string(array_agg(fdata), ', ', '*')
-                FROM formatted_data
-                """
-                % (UserDefinedCollectionValue._meta.db_table,
-                   field_definition_id, table))
-        elif field_name.startswith('udf:'):
+        if field_name.startswith('udf:'):
             name = field_name[4:]
-            extra_select[prefixed_name] = "%s.udfs->'%s'" % (table, name)
+            if name in model_class.collection_udf_settings.keys():
+                field_definition_id = None
+                for udfd in udf_defs(instance, model):
+                    if udfd.iscollection and udfd.name == name:
+                        field_definition_id = udfd.id
+
+                if field_definition_id is None:
+                    continue
+
+                select[prefixed_name] = (
+                    """
+                    WITH formatted_data AS (
+                        SELECT concat('(', data, ')') as fdata
+                        FROM %s
+                        WHERE field_definition_id = %s and model_id = %s.id
+                    )
+
+                    SELECT array_to_string(array_agg(fdata), ', ', '*')
+                    FROM formatted_data
+                    """
+                    % (UserDefinedCollectionValue._meta.db_table,
+                       field_definition_id, table))
+            else:
+                select[prefixed_name] = "{0}.udfs->%s".format(table)
+                select_params.append(name)
         else:
             if not model_hasattr(dummy_instance, field_name):
                 # Exception will be raised downstream if you look for
@@ -103,7 +111,7 @@ def extra_select_and_values_for_model(
 
         prefixed_names.append(prefixed_name)
 
-    return (extra_select, prefixed_names)
+    return prefixed_names
 
 
 @task
@@ -127,15 +135,19 @@ def async_users_export(job, data_format):
 def async_csv_export(job, model, query, display_filters):
     instance = job.instance
 
+    select = OrderedDict()
+    select_params = []
+    field_header_map = {}
     if model == 'species':
         initial_qs = (Species.objects.
                       filter(instance=instance))
-
-        extra_select, values = extra_select_and_values_for_model(
-            instance, job, 'treemap_species', 'Species')
-        ordered_fields = values + extra_select.keys()
-        limited_qs = initial_qs.extra(select=extra_select)\
-                               .values(*ordered_fields)
+        values = _values_for_model(instance, job, 'treemap_species',
+                                   'Species', select, select_params)
+        field_names = values + select.keys()
+        limited_qs = (initial_qs
+                      .extra(select=select,
+                             select_params=select_params)
+                      .values(*field_names))
     else:
         # model == 'tree'
 
@@ -146,38 +158,40 @@ def async_csv_export(job, model, query, display_filters):
         # get the plots for the provided
         # query and turn them into a tree queryset
         initial_qs = Filter(query, display_filters, instance)\
-            .get_objects(Tree)
+            .get_objects(Plot)
 
-        extra_select_tree, values_tree = extra_select_and_values_for_model(
-            instance, job, 'treemap_tree', 'Tree')
-        extra_select_plot, values_plot = extra_select_and_values_for_model(
+        tree_fields = _values_for_model(
+            instance, job, 'treemap_tree', 'Tree',
+            select, select_params,
+            prefix='tree')
+        plot_fields = _values_for_model(
             instance, job, 'treemap_mapfeature', 'Plot',
-            prefix='plot')
-        extra_select_sp, values_sp = extra_select_and_values_for_model(
+            select, select_params)
+        species_fields = _values_for_model(
             instance, job, 'treemap_species', 'Species',
-            prefix='species')
+            select, select_params,
+            prefix='tree__species')
 
-        if 'plot__geom' in values_plot:
-            values_plot = [f for f in values_plot if f != 'plot__geom']
-            values_plot += ['plot__geom__x', 'plot__geom__y']
+        if 'geom' in plot_fields:
+            plot_fields = [f for f in plot_fields if f != 'geom']
+            plot_fields += ['geom__x', 'geom__y']
+
+        if tree_fields:
+            select['tree_present'] = "treemap_tree.id is not null"
+            plot_fields += ['tree_present']
 
         get_ll = 'ST_Transform(treemap_mapfeature.the_geom_webmercator, 4326)'
-        extra_select = {'plot__geom__x':
-                        'ST_X(%s)' % get_ll,
-                        'plot__geom__y':
-                        'ST_Y(%s)' % get_ll}
+        select['geom__x'] = 'ST_X(%s)' % get_ll
+        select['geom__y'] = 'ST_Y(%s)' % get_ll
 
-        extra_select.update(extra_select_tree)
-        extra_select.update(extra_select_plot)
-        extra_select.update(extra_select_sp)
+        field_names = set(tree_fields + plot_fields + species_fields)
 
-        ordered_fields = (sorted(values_tree) +
-                          sorted(values_plot) +
-                          sorted(values_sp))
-
-        if ordered_fields:
-            limited_qs = initial_qs.extra(select=extra_select)\
-                                   .values(*ordered_fields)
+        if field_names:
+            field_header_map = _csv_field_header_map(field_names)
+            limited_qs = (initial_qs
+                          .extra(select=select,
+                                 select_params=select_params)
+                          .values(*field_header_map.keys()))
         else:
             limited_qs = initial_qs.none()
 
@@ -191,10 +205,54 @@ def async_csv_export(job, model, query, display_filters):
         job.status = ExportJob.MODEL_PERMISSION_ERROR
     else:
         csv_file = TemporaryFile()
-        write_csv(limited_qs, csv_file, field_order=ordered_fields)
-        job.complete_with(generate_filename(limited_qs), File(csv_file))
+        write_csv(limited_qs, csv_file,
+                  field_order=field_header_map.keys(),
+                  field_header_map=field_header_map)
+        filename = generate_filename(limited_qs).replace('plot', 'tree')
+        job.complete_with(filename, File(csv_file))
 
     job.save()
+
+
+def _csv_field_header_map(field_names):
+    map = OrderedDict()
+    # TODO: make this conditional based on whether or not
+    # we are performing a complete export or an "importable" export
+    omit = {'readonly',
+            'tree__readonly',
+            'tree__species', 'tree__id',
+            'tree__species__fact_sheet_url',
+            'tree__species__fall_conspicuous',
+            'tree__species__flower_conspicuous',
+            'tree__species__flowering_period',
+            'tree__species__fruit_or_nut_period',
+            'tree__species__has_wildlife_value',
+            'tree__species__id',
+            'tree__species__is_native',
+            'tree__species__max_diameter',
+            'tree__species__max_height',
+            'tree__species__otm_code',
+            'tree__species__palatable_human',
+            'tree__species__plant_guide_url'}
+
+    field_names = field_names - omit
+
+    for name, header in fields.trees.EXPORTER_PAIRS:
+        if name in field_names:
+            map[name] = header.title()
+            field_names.remove(name)
+
+    for name in sorted(field_names):
+        if name.startswith('udf:'):
+            header = 'Planting Site: ' + name[4:]
+        elif name.startswith('tree__udf:'):
+            header = 'Tree: ' + name[10:]
+        else:
+            logger.warn('Unrecognized export field name',
+                        extra={'extra_data': {'field_name': name}})
+            continue
+        map[name] = header
+    return map
 
 
 @task

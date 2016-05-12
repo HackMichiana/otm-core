@@ -9,10 +9,10 @@ opentreemap/opentreemap/settings/local_settings.py
 /static
 .coverage
 .sass-cache
+.DS_Store
 Guardfile
 opentreemap/.idea
 node_modules/
-opentreemap/beta
 opentreemap/cloud_management
 opentreemap/la
 opentreemap/map_features

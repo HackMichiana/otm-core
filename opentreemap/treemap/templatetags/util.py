@@ -2,9 +2,16 @@ from django import template
 from django.core.urlresolvers import reverse
 from django.core.exceptions import ObjectDoesNotExist
 
+import json
+
+from opentreemap.util import dotted_split
+
 from treemap.models import MapFeature, Tree, TreePhoto, MapFeaturePhoto, Audit
 from treemap.udf import UserDefinedCollectionValue
-from treemap.util import get_filterable_audit_models
+from treemap.util import (get_filterable_audit_models, to_model_name,
+                          safe_get_model_class)
+from treemap.units import Convertible
+
 
 register = template.Library()
 
@@ -88,7 +95,13 @@ def audit_detail_link(audit):
 
 
 @register.filter
-def display_name(audit_or_model_or_name):
+def terminology(model, instance):
+    return model.terminology(instance)
+
+
+@register.filter
+def display_name(audit_or_model_or_name, instance=None):
+    audit = None
     if isinstance(audit_or_model_or_name, (Audit, basestring)):
         if isinstance(audit_or_model_or_name, Audit):
             audit = audit_or_model_or_name
@@ -98,13 +111,18 @@ def display_name(audit_or_model_or_name):
             name = audit_or_model_or_name
             extra_args = []
         if name.startswith('udf:'):
-            name = (UserDefinedCollectionValue
-                    .get_display_model_name(name, *extra_args))
+            return UserDefinedCollectionValue.get_display_model_name(
+                name, *extra_args)
     else:
         name = audit_or_model_or_name.__class__.__name__
 
-    if name.lower() == 'plot':
-        return 'Planting Site'
+    if audit:
+        return audit.model_display_name()
+
+    cls = safe_get_model_class(name)
+    if issubclass(cls, Convertible):
+        # Sometimes instance will be None here, so we'll use the default name
+        return cls.display_name(instance)
     else:
         return name
 
@@ -123,3 +141,21 @@ def tabindex(value, index):
     """
     value.field.widget.attrs['tabindex'] = index
     return value
+
+
+@register.filter
+def identifier_model_name(identifier):
+    """
+    Takes an identifier like "model.field" and returns the model's display name
+    """
+    object_name, __ = dotted_split(identifier, 2, maxsplit=1)
+
+    return display_name(to_model_name(object_name))
+
+
+@register.filter
+def lat_lng_coordinates_json(geom):
+    if not geom:
+        return "''"
+    else:
+        return json.dumps(geom.transform(4326, clone=True).tuple[0][0])

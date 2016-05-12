@@ -49,18 +49,30 @@
     </tbody>
   </table>
 
+  {% if not containing_polygonalmapfeature %}
   {# Render collection UDF fields for the Tree #}
   {% if tree %}
     {% for udf in tree.collection_udfs %}
-      {% with values=tree.udfs|get:udf.name %}
-          {% include "treemap/partials/collectionudf.html" with udf=udf model=tree values=values %}
+      {% with values=tree.udfs|get:udf.name title_prefix=udf.model_type|display_name %}
+          {% include "treemap/partials/collectionudf.html" with udf=udf title_prefix=title_prefix model=tree values=values %}
         {% endwith %}
     {% endfor %}
   {% endif %}
+  {% endif %}
 </div>
 
+<h3>{% trans "Planting Site Information" %}</h3>
+{% if containing_polygonalmapfeature %}
+<div class="well" id="containing-polygonalmapfeature">
+  {% with pmf_id=containing_polygonalmapfeature.pk|unlocalize %}
+  {% url 'map_feature_detail' instance_url_name=request.instance.url_name feature_id=pmf_id as polygonal_url %}
+  {% blocktrans with display_name=containing_polygonalmapfeature.terminology.singular %}
+  This tree is part of <a href="{{ polygonal_url }}">{{ display_name }} #{{ pmf_id }}.</a> For stewardship actions, please <a href="{{ polygonal_url }}">go to the {{ display_name }} detail page.</a>
+  {% endblocktrans %}
+  {% endwith %}
+</div>
+{% else %}
 <table class="table table-hover">
-  <h3>{% trans "Planting Site Information" %}</h3>
   <tbody>
     {% trans "Width" as width %}
     {% field width from "plot.width" for request.user withtemplate "treemap/field/tr.html" %}
@@ -86,10 +98,12 @@
 
 {# Render collection UDF fields for the Plot  #}
 {% for udf in plot.collection_udfs %}
-  {% with values=plot.udfs|get:udf.name %}
-    {% include "treemap/partials/collectionudf.html" with udf=udf model=plot values=values %}
+  {% with values=plot.udfs|get:udf.name title_prefix=udf.model_type|display_name %}
+    {% include "treemap/partials/collectionudf.html" with udf=udf title_prefix=title_prefix model=plot values=values %}
   {% endwith %}
 {% endfor %}
+
+{% endif %}
 
 <!-- Ecosystem Benefits -->
 <div id="ecobenefits">
@@ -109,6 +123,18 @@
 </div>
 
 {% endblock subclass_details %}
+
+{% block delete_confirmation_text %}
+<p id="delete-tree-warning" style="display: none;">
+  <strong>{% trans "Warning!" %}</strong>
+  {% trans "You are about to delete this tree. Do you want to continue?" %}
+</p>
+<p id="delete-plot-warning" style="display: none;">
+  <strong>{% trans "Warning!" %}</strong>
+  {% trans "You are about to delete this planting site. Once deleted, it will not be possible to view the details of this planting site or the trees it has contained in the past. Are you sure you want to continue?" %}
+</p>
+{% endblock %}
+
 
 {% block scripts %}
 
@@ -135,9 +161,11 @@
           addTreeControls: '#add-tree-controls',
           treeSection: '#tree-details',
           inlineEditForm: mapFeatureOptions.inlineEditForm,
+          deleteControls: mapFeatureOptions.deleteControls,
+          config: mapFeatureOptions.config,
           form: mapFeature.inlineEditForm,
           typeaheads: [{
-              name: "species-edit",
+              name: "species",
               url: config.instance.url + "species/",
               input: "#plot-species-typeahead",
               template: "#species-element-template",

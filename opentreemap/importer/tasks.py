@@ -7,18 +7,14 @@ import json
 
 from celery import task, chord
 from django.core.exceptions import ObjectDoesNotExist
-from django.db import transaction
-
-from treemap.models import Species
+from django.conf import settings
 
 from importer.models.base import GenericImportEvent, GenericImportRow
 from importer.models.species import SpeciesImportEvent, SpeciesImportRow
 from importer.models.trees import TreeImportEvent, TreeImportRow
-from importer import errors, fields
+from importer import errors
 from importer.util import (clean_row_data, clean_field_name,
                            utf8_file_to_csv_dictreader)
-
-BLOCK_SIZE = 250
 
 
 def _create_rows_for_event(ie, csv_file):
@@ -26,7 +22,7 @@ def _create_rows_for_event(ie, csv_file):
     # so we can show progress. Caller does manual cleanup if necessary.
     reader = utf8_file_to_csv_dictreader(csv_file)
 
-    field_names = reader.fieldnames
+    field_names = [f.strip() for f in reader.fieldnames]
     ie.field_order = json.dumps(field_names)
     ie.save()
 
@@ -44,7 +40,7 @@ def _create_rows_for_event(ie, csv_file):
         return True
     else:
         ie.status = ie.FAILED_FILE_VERIFICATION
-        ie.save()
+        ie.mark_finished_and_save()
         return False
 
 
@@ -58,7 +54,8 @@ def _create_rows(ie, reader):
         rows.append(RowModel(data=data, import_event=ie, idx=idx))
 
         idx += 1
-        if int(idx / BLOCK_SIZE) * BLOCK_SIZE == idx:
+        if ((int(idx / settings.IMPORT_BATCH_SIZE) *
+             settings.IMPORT_BATCH_SIZE == idx)):
             RowModel.objects.bulk_create(rows)
             rows = []
 
@@ -72,12 +69,12 @@ def run_import_event_validation(import_type, import_event_id, file_obj):
 
     try:
         ie.status = GenericImportEvent.LOADING
-        ie.save()
+        ie.update_progress_timestamp_and_save()
         success = _create_rows_for_event(ie, file_obj)
     except Exception as e:
         ie.append_error(errors.GENERIC_ERROR, data=[str(e)])
         ie.status = GenericImportEvent.FAILED_FILE_VERIFICATION
-        ie.save()
+        ie.mark_finished_and_save()
         success = False
 
     if not success:
@@ -88,68 +85,85 @@ def run_import_event_validation(import_type, import_event_id, file_obj):
         return
 
     ie.status = GenericImportEvent.PREPARING_VERIFICATION
-    ie.save()
+    ie.update_progress_timestamp_and_save()
 
     try:
-        row_set = ie.rows()
-        validation_tasks = (_validate_rows.subtask(row_set[i:(i+BLOCK_SIZE)])
-                            for i in xrange(0, ie.row_count, BLOCK_SIZE))
+        validation_tasks = []
+        for i in xrange(0, ie.row_count, settings.IMPORT_BATCH_SIZE):
+            validation_tasks.append(_validate_rows.s(import_type, ie.id, i))
 
         final_task = _finalize_validation.si(import_type, import_event_id)
-        res = chord(validation_tasks, final_task).delay()
+
+        async_result = chord(validation_tasks, final_task).delay()
+        group_result = async_result.parent
+        if group_result:  # Has value None when run in unit tests
+            group_result.save()
+            ie.task_id = group_result.id
 
         ie.status = GenericImportEvent.VERIFIYING
-        ie.task_id = res.id
-        ie.save()
+        ie.update_progress_timestamp_and_save()
     except Exception as e:
         ie.status = GenericImportEvent.VERIFICATION_ERROR
-        ie.save()
+        ie.mark_finished_and_save()
         try:
             ie.append_error(errors.GENERIC_ERROR, data=[str(e)])
             ie.save()
-            ie.row_set().delete()
+            # I don't think this ever worked in the past.
+            # TODO: delete?
+            ie.rows().delete()
         except Exception:
+            # This has shown to swallow real exceptions in development.
+            # TODO: At the very least, we should add logging.
             pass
         return
 
 
 @task()
-def _validate_rows(*rows):
+def _validate_rows(import_type, import_event_id, start_row_id):
+    ie = _get_import_event(import_type, import_event_id)
+    rows = ie.rows()[start_row_id:(start_row_id+settings.IMPORT_BATCH_SIZE)]
     for row in rows:
         row.validate_row()
+    ie.update_progress_timestamp_and_save()
 
 
 @task()
 def _finalize_validation(import_type, import_event_id):
     ie = _get_import_event(import_type, import_event_id)
 
-    ie.task_id = ''
     # There shouldn't be any rows left to verify, but it doesn't hurt to check
     if _get_waiting_row_count(ie) == 0:
         ie.status = GenericImportEvent.FINISHED_VERIFICATION
+    else:
+        # TODO: if we're going to check, we should probably raise
+        pass
 
-    ie.save()
+    ie.mark_finished_and_save()
 
 
 @task()
 def commit_import_event(import_type, import_event_id):
     ie = _get_import_event(import_type, import_event_id)
 
-    commit_tasks = [_commit_rows.s(import_type, import_event_id, i)
-                    for i in xrange(0, ie.row_count, BLOCK_SIZE)]
+    commit_tasks = [
+        _commit_rows.s(import_type, import_event_id, i)
+        for i in xrange(0, ie.row_count, settings.IMPORT_BATCH_SIZE)]
 
     finalize_task = _finalize_commit.si(import_type, import_event_id)
 
-    chord(commit_tasks, finalize_task).delay()
+    async_result = chord(commit_tasks, finalize_task).delay()
+    if async_result:
+        ie.task_id = async_result.id
+        ie.save()
 
 
-@task()
-@transaction.atomic
+@task(rate_limit=settings.IMPORT_COMMIT_RATE_LIMIT)
 def _commit_rows(import_type, import_event_id, i):
     ie = _get_import_event(import_type, import_event_id)
 
-    for row in ie.rows()[i:(i + BLOCK_SIZE)]:
+    for row in ie.rows()[i:(i + settings.IMPORT_BATCH_SIZE)]:
         row.commit_row()
+    ie.update_progress_timestamp_and_save()
 
 
 @task()
@@ -157,10 +171,15 @@ def _finalize_commit(import_type, import_event_id):
     ie = _get_import_event(import_type, import_event_id)
 
     ie.status = GenericImportEvent.FINISHED_CREATING
-    ie.save()
+    ie.mark_finished_and_save()
 
+    # A species import could change a species' i-Tree region,
+    # affecting eco
+    rev_updates = ['eco_rev', 'universal_rev']
     if import_type == TreeImportEvent.import_type:
-        ie.instance.update_geo_rev()
+        rev_updates.append('geo_rev')
+
+    ie.instance.update_revs(*rev_updates)
 
 
 def _get_import_event(import_type, import_event_id):
@@ -196,25 +215,6 @@ def _get_waiting_row_count(ie):
     return ie.rows()\
              .filter(status=GenericImportRow.WAITING)\
              .count()
-
-
-def _species_export_builder(model):
-    model_dict = model.as_dict()
-    obj = {}
-
-    for k, v in SpeciesImportRow.SPECIES_MAP.iteritems():
-        if v in fields.species.ALL:
-            if k in model_dict:
-                val = model_dict[k]
-                if not val is None:
-                    obj[v] = val
-    return obj
-
-
-@task
-def get_all_species_export(instance_id):
-    return [_species_export_builder(species) for species
-            in Species.objects.filter(instance_id=instance_id)]
 
 
 @task

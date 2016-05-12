@@ -26,10 +26,8 @@ urlpatterns = patterns(
     url(r'^photo_review_full/$', routes.photo_review),
     url(r'^photo_review/$', routes.photo_review_partial,
         name='photo_review'),
-    url(r'^photo_review/next$', routes.next_photo, name='photo_review_next'),
-    url('^features/(?P<feature_id>\d+)/photo/(?P<photo_id>\d+)/'
-        '(?P<action>(approve)|(reject))$',
-        routes.approve_or_reject_photo, name='approve_or_reject_photo'),
+    url('^photo_review/approve-reject/(?P<action>(approve)|(reject))$',
+        routes.approve_or_reject_photos, name='approve_or_reject_photos'),
     url(r'^species/$', routes.species_list, name="species_list_view"),
     url(r'^map/$', routes.map_page, name='map'),
 
@@ -38,7 +36,7 @@ urlpatterns = patterns(
     url(r'^features/(?P<type>\w+)/$',
         routes.add_map_feature, name='add_map_feature'),
     url(r'^features/(?P<feature_id>\d+)/(?P<edit>edit)$',
-        routes.edit_plot_detail, name='map_feature_detail_edit'),
+        routes.edit_map_feature_detail, name='map_feature_detail_edit'),
     url(r'^features/(?P<feature_id>\d+)/popup$',
         routes.map_feature_popup, name='map_feature_popup'),
     url(r'^features/(?P<feature_id>\d+)/trees/(?P<tree_id>\d+)/$',

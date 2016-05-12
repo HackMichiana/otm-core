@@ -47,7 +47,7 @@
       {% block topnav %}
       <!-- Top Nav -->
       <div class="navbar navbar-inverse navbar-fixed-top">
-        <div class="collapse navbar-collapse" id="otm-navbar-collapse">
+        <div class="navbar-collapse" id="otm-navbar-collapse">
           <ul class="pull-left nav navbar-nav navbar-left">
             {# Since the active style changes on a page-by-page basis we use nested blocks below. These nested blocks can then be overriden to change which tab is active. #}
             {% block instancetopnav %}
@@ -56,7 +56,7 @@
               {% if last_instance|feature_enabled:'add_plot' and last_effective_instance_user %}
               <li data-feature="add_plot">
                 <a data-class='add-tree'
-                   data-always-enable='{{ last_effective_instance_user|plot_is_writable }}'
+                   data-always-enable='{{ last_effective_instance_user|plot_is_creatable }}'
                    data-disabled-title='{% trans "Adding trees is not available to all users" %}'
                    data-href="{% url 'map' instance_url_name=last_instance.url_name %}?m=addTree"
                    disabled='disabled'>{% trans "Add a Tree" %}</a>
@@ -137,6 +137,11 @@
         </div>
         {% endblock logo %}
 
+        <div class="toolbar-wrapper">
+          {% block toolbar %}
+          {% endblock toolbar %}
+        </div>
+
         <div class="search-wrapper">
           {% block search %}
           {% endblock search %}
@@ -155,6 +160,9 @@
 
       {% block content %}
       {% endblock content %}
+
+      {% block endbody %}
+      {% endblock endbody %}
 
     </div>
 
@@ -204,9 +212,6 @@
           require("treemap/export").run({ config: otm.settings });
       })(require);
     </script>
-
-    {% block endbody %}
-    {% endblock endbody %}
 
   </body>
 </html>

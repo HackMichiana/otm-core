@@ -18,31 +18,30 @@
 
 {% block instancetopnav %}
 {% if request.instance|feature_enabled:'add_plot' and last_effective_instance_user %}
-  {% if request.instance.supports_resources %}
+  {% if request.instance.has_resources %}
     <li class="add-menu dropdown" data-feature="add_plot">
-      <a class="dropdown-toggle" data-toggle="dropdown"
-         data-always-enable="true"
-         data-disabled-title='{% trans "Adding trees is not available to all users" %}'
-         disabled='disabled'>
+      <a class="dropdown-toggle" data-toggle="dropdown">
         <i class="icon-plus-circled"></i>
       </a>
       <ul class="dropdown-menu">
         <li>
           <a data-href="{% url 'map' instance_url_name=request.instance.url_name %}?m=addTree"
-             data-always-enable="{{ last_effective_instance_user|plot_is_writable }}"
+             data-always-enable="{{ last_effective_instance_user|plot_is_creatable }}"
+             data-disabled-title='{% trans "Adding trees is not available to all users" %}'
              data-action='addtree'>{% trans "Add a Tree" %}</a>
         </li>
         <li>
           <a data-href="{% url 'map' instance_url_name=request.instance.url_name %}?m=addResource"
-             data-always-enable="{{ last_effective_instance_user|plot_is_writable }}"
-             data-action='addresource'>{% trans "Add a" %} {{ term.Resource }}</a>
+             data-always-enable="{{ last_effective_instance_user|any_resource_is_creatable }}"
+             data-disabled-title='{% blocktrans with resources=term.Resource.plural %}Adding {{ resources }} is not available to all users{% endblocktrans %}'
+             data-action='addresource'>{% trans "Add a" %} {{ term.Resource.singular }}</a>
         </li>
       </ul>
     </li>
   {% else %}
     <li data-feature="add_plot">
       <a data-action='addtree'
-         data-always-enable='{{ last_effective_instance_user|plot_is_writable }}'
+         data-always-enable='{{ last_effective_instance_user|plot_is_creatable }}'
          data-disabled-title='{% trans "Adding trees is not available to all users" %}'
          data-href="{% url 'map' instance_url_name=request.instance.url_name %}?m=addTree"
          disabled='disabled'>{% trans "Add a Tree" %}</a>
@@ -60,13 +59,10 @@
 
 {% if settings.MODELING_VIEW_NAME %}
   {% if request.instance|feature_enabled:'modeling' %}
-    <li class="dropdown {% block activemodeling %}{% endblock %}">
-      <a class="dropdown-toggle" data-toggle="dropdown">{% trans "Plan" %}</a>
-      <ul class="modeling dropdown-menu">
-        <li><a href="{% url settings.MODELING_VIEW_NAME instance_url_name=request.instance.url_name %}?m=prioritization" class="switch-prioritization-tab">{% trans "Prioritize Planting Sites" %}</a></li>
-        <li><a href="{% url settings.MODELING_VIEW_NAME instance_url_name=request.instance.url_name %}?m=scenarios" class="switch-scenarios-tab">{% trans "Model Urban Forest Scenarios" %}</a></li>
-        <li><a href="">{% trans "Saved Simulations" %}</a></li>
-      </ul>
+    <li class="{% block activemodeling %}{% endblock %} hidden-xs">
+      <a href="{% url settings.MODELING_VIEW_NAME instance_url_name=request.instance.url_name %}">
+        <span>{% trans "Plan" %}</span>
+      </a>
     </li>
   {% endif %}
 {% endif %}
@@ -97,36 +93,30 @@
 
 {% block subhead %}
 <div class="subhead">
-  {% with advanced_search_fields=request.instance.advanced_search_fields %}
   {% if request.instance|feature_enabled:'advanced_search_filters' %}
   <div class="advanced-search">
-    <div class="container">
-      <div class="row">
-        <div class="col-md-6">
-          <h4>{% trans "Detail Filters" %}</h4>
-          {% for json in request.instance.advanced_search_fields.standard %}
-            {% search from json for request.user in request.instance withtemplate "treemap/field/search.html" %}
-          {% endfor %}
-        </div>
-        <div class="col-md-3" id="display-filters" data-search-type="IN"
-            data-search-identifier="mapFeature.feature_type">
-          <h4>{% trans "Display Filters" %}</h4>
-          {% for field in request.instance.advanced_search_fields.display %}
-            {% include "treemap/partials/display_filters.html" %}
-          {% endfor %}
-        </div>
-        <div class="col-md-3" id="missing-data">
-          <h4>{% trans "Missing Data" %}</h4>
-          {% for json in request.instance.advanced_search_fields.missing %}
-            {% search from json for request.user in request.instance withtemplate "treemap/field/search.html" %}
-          {% endfor %}
-        </div>
-      </div>
+    {# Define udfc variables here so we can hide the dropdown when empty #}
+    {% with udfc_search_data=request.instance|get_udfc_search_fields:request.user %}
+      {% with udfc=udfc_search_data.udfc %}
+        {% if udfc %}
+          {% include "treemap/partials/advanced_search/tree_care.html" with category='stewardship' align_left=1 fields=1 %}
+        {% else %}
+          &nbsp; {# Otherwise following dropdowns are cut off #}
+        {% endif %}
+      {% endwith %}
+    {% endwith %}
+    <div class="pull-right">
+      {% with fields=request.instance|get_advanced_search_fields:request.user %}
+        {% include "treemap/partials/advanced_search/dropdown.html" with fields=fields.general category='mapFeature' title=_("General") %}
+        {% include "treemap/partials/advanced_search/display.html" with fields=fields.display category='display' %}
+        {% include "treemap/partials/advanced_search/dropdown.html" with fields=fields.Tree category='tree' feature='Tree' title=_("Trees") %}
+        {% include "treemap/partials/advanced_search/dropdown.html" with fields=fields.Plot category='plot' feature='Plot' title=_("Planting Sites") %}
+        {% include "treemap/partials/advanced_search/dropdown.html" with fields=fields.missing category='missing' title=_("Missing") %}
+        {% include "treemap/partials/advanced_search/more.html" with fields=fields.more category='more' %}
+      {% endwith %}
     </div>
   </div>
   {% endif %}
-
-  {% include "udfc_search.html" %}
 
   <div class="stats-bar hidden-xs">
     <div class="half">
@@ -143,27 +133,25 @@
     </div>
     <div class="half">
       {% if request.instance|feature_enabled:'add_plot' and last_effective_instance_user %}
-        {% if request.instance.supports_resources %}
+        {% if request.instance.has_resources %}
         <a class="btn btn-primary addBtn"
            data-action='addresource'
-           data-feature="add_plot"
-           data-always-enable="{{ last_effective_instance_user|plot_is_writable }}"
+           data-always-enable="{{ last_effective_instance_user|any_resource_is_creatable }}"
            data-disabled-title=
-             "{% blocktrans with resources=terms.resources %}Adding {{ resources }} is not available to all users {% endblocktrans %}"
+             "{% blocktrans with resources=term.Resource.plural.lower %}Adding {{ resources }} is not available to all users {% endblocktrans %}"
            data-href="{% url 'map' instance_url_name=request.instance.url_name %}?m=addResource"
-           disabled="disabled"><i class="icon-plus"></i> {% trans "Add a" %} {{ term.Resource }}</a>
+           disabled="disabled"><i class="icon-plus"></i> {% trans "Add a" %} {{ term.Resource.singular }}</a>
         {% endif %}
       <a class="btn btn-primary addBtn"
          data-action='addtree'
          data-feature="add_plot"
-         data-always-enable="{{ last_effective_instance_user|plot_is_writable }}"
+         data-always-enable="{{ last_effective_instance_user|plot_is_creatable }}"
          data-disabled-title="{% trans "Adding trees is not available to all users" %}"
          data-href="{% url 'map' instance_url_name=request.instance.url_name %}?m=addTree"
          disabled="disabled"><i class="icon-plus"></i> {% trans "Add a Tree" %}</a>
       {% endif %}
     </div>
   </div>
-  {% endwith %}
 </div>
 {% endblock subhead %}
 
@@ -180,11 +168,11 @@
 
 {% block searchoptions %}
 <div class="search-options">
-  <a id="perform-search" class="btn btn-primary btn-lg btn-block">{% trans "Search" %}</a>
   <div class="btn-group">
     <button id="search-advanced" class="btn btn-default btn-sm">{% trans "Advanced" %}</button>
     <button id="search-reset" class="btn btn-default btn-sm">{% trans "Reset" %}</button>
   </div>
+  <a id="perform-search" class="btn btn-primary btn-lg btn-block">{% trans "Search" %}</a>
 </div>
 {% endblock searchoptions %}
 
@@ -219,12 +207,16 @@
 {% block templates %}
 {% verbatim %}
 <script id="species-element-template" type="text/x-mustache-template">
+<div>
   <p>{{common_name}}</p>
   <p>{{scientific_name}}</p>
+</div>
 </script>
 <script id="boundary-element-template" type="text/x-mustache-template">
+<div>
   <p>{{name}}</p>
   <p>{{category}}</p>
+</div>
 </script>
 
 <script id="geocode-results-template" type="text/x-mustache-template">

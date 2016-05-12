@@ -6,6 +6,7 @@ from __future__ import division
 import json
 import copy
 import re
+from datetime import date, datetime
 
 from django.core.exceptions import ValidationError, FieldError
 from django.utils.translation import ugettext_lazy as _
@@ -14,14 +15,15 @@ from django.db import transaction
 from django.db.models import Q
 from django.db.models.fields.subclassing import Creator
 from django.db.models.base import ModelBase
+from django.db.models.lookups import Lookup
 from django.db.models.sql.constants import ORDER_PATTERN
 from django.db.models.signals import post_save, post_delete
 
-from django.contrib.gis.db.models.sql.query import GeoQuery
+from django.db.models.sql.query import Query
 
 from django_hstore.fields import DictionaryField, HStoreDict
 from django_hstore.managers import HStoreManager, HStoreGeoManager
-from django_hstore.query import HStoreGeoQuerySet, HStoreGeoWhereNode
+from django_hstore.query import HStoreGeoQuerySet
 
 from treemap.instance import Instance
 from treemap.audit import (UserTrackable, Audit, UserTrackingException,
@@ -33,17 +35,17 @@ from treemap.lib.dates import (parse_date_string_with_or_without_time,
                                DATETIME_FORMAT)
 from treemap.util import safe_get_model_class, to_object_name
 
+from treemap.decorators import classproperty
+
+
 # Allow anything except certain known problem characters.
 # NOTE: Make sure to keep the validation error associated with this up-to-date
-# '%' in general makes the Django ORM error out.
-# '__' is also problematic for the Django ORM
-# '.' is fine for the ORM, but made the template system unhappy.
-_UDF_NAME_REGEX = re.compile(r'^[^_%.]+$')
-
-# Used for collection UDF search on the web
-# if we come to support more udfcs, we can add them here.
-UDFC_MODELS = ('Tree', 'Plot')
-UDFC_NAMES = ('Stewardship', 'Alerts')
+# * '%' in general makes the Django ORM error out.
+# * '__' is also problematic for the Django ORM
+# * '.' is fine for the ORM, but made the template system unhappy.
+# * '"' makes the ORM error out when building 'AS' clauses and wrapping
+#   them with quotes.
+_UDF_NAME_REGEX = re.compile(r'^[^_"%.]+$')
 
 
 def safe_get_udf_model_class(model_string):
@@ -116,6 +118,7 @@ class UserDefinedCollectionValue(UserTrackable, models.Model):
                 # udf:<pk of UserDefinedFieldDefinition>
                 pk = int(audit_name[4:])
                 if not instance:
+                    # TODO: should use caching (udf_defs)
                     udf_def = UserDefinedFieldDefinition.objects.get(pk=pk)
                     return udf_def.name
                 else:
@@ -313,6 +316,9 @@ class UserDefinedFieldDefinition(models.Model):
     """
     name = models.CharField(max_length=255)
 
+    class Meta:
+        unique_together = ('instance', 'model_type', 'name')
+
     def __unicode__(self):
         return ('%s.%s%s' %
                 (self.model_type, self.name,
@@ -329,14 +335,14 @@ class UserDefinedFieldDefinition(models.Model):
 
     def _validate_and_update_choice(
             self, datatype, old_choice_value, new_choice_value):
-        if datatype['type'] != 'choice':
+        if datatype['type'] not in ('choice', 'multichoice'):
             raise ValidationError(
-                {'datatype': [_("can't change choices "
+                {'datatype': [_("Can't change choices "
                                 "on a non-choice field")]})
 
         if old_choice_value not in datatype['choices']:
             raise ValidationError(
-                {'datatype': [_("choice '%(choice)s' not found") % {
+                {'datatype': [_("Choice '%(choice)s' not found") % {
                     'choice': old_choice_value}]})
 
         choices = datatype['choices']
@@ -349,19 +355,40 @@ class UserDefinedFieldDefinition(models.Model):
         datatype['choices'] = choices
         return datatype
 
+    @property
+    def model_config(self):
+        Model = safe_get_udf_model_class(self.model_type)
+        return getattr(Model, 'udf_settings', {}).get(self.name, {})
+
     def _update_choice_scalar(self, old_choice_value, new_choice_value):
+        Model = safe_get_udf_model_class(self.model_type)
+
+        if self.datatype_dict['type'] == 'choice':
+            for model in Model.objects\
+                              .filter(**{self.canonical_name:
+                                         old_choice_value}):
+                model.udfs[self.name] = new_choice_value
+                model.save_base()
+
+        else:  # multichoice
+            udf_filter = {'instance': self.instance,
+                          # grab anything with that key
+                          'udfs__contains': [self.name]}
+            models = Model.objects.filter(**udf_filter)
+
+            for model in models:
+                newval = self._list_replace_or_remove(
+                    model.udfs[self.name],
+                    old_choice_value,
+                    new_choice_value)
+                model.udfs[self.name] = newval
+                model.save_base()
+
         datatype = self._validate_and_update_choice(
             self.datatype_dict, old_choice_value, new_choice_value)
 
         self.datatype = json.dumps(datatype)
         self.save()
-
-        Model = safe_get_udf_model_class(self.model_type)
-        for model in Model.objects\
-                          .filter(**{'udf:%s' % self.name:
-                                     old_choice_value}):
-            model.udfs[self.name] = new_choice_value
-            model.save_base()
 
         audits = Audit.objects.filter(
             model=self.model_type,
@@ -374,15 +401,38 @@ class UserDefinedFieldDefinition(models.Model):
     def _update_choices_on_audits(
             self, audits, old_choice_value, new_choice_value):
 
-        cval_audits = audits.filter(current_value=old_choice_value)
-        pval_audits = audits.filter(previous_value=old_choice_value)
-
-        if new_choice_value is None:
-            cval_audits.delete()
-            pval_audits.delete()
+        if self.iscollection or self.datatype_dict['type'] == 'choice':
+            cval_audits = audits.filter(current_value=old_choice_value)
+            pval_audits = audits.filter(previous_value=old_choice_value)
+            if new_choice_value is None:
+                cval_audits.delete()
+                pval_audits.delete()
+            else:
+                cval_audits.update(current_value=new_choice_value)
+                pval_audits.update(previous_value=new_choice_value)
         else:
-            cval_audits.update(current_value=new_choice_value)
-            pval_audits.update(previous_value=new_choice_value)
+            for audit in audits.filter(field=self.canonical_name,
+                                       model=self.model_type):
+                audit.current_value = json.dumps(
+                    self._list_replace_or_remove(
+                        json.loads(audit.current_value or '[]'),
+                        old_choice_value,
+                        new_choice_value))
+                audit.previous_value = json.dumps(
+                    self._list_replace_or_remove(
+                        json.loads(audit.previous_value or '[]'),
+                        old_choice_value,
+                        new_choice_value))
+                audit.save()
+
+    def _list_replace_or_remove(self, l, old, new):
+        if l is None:
+            return None
+        new_l = filter(
+            None,
+            [(new if choice == old else choice)
+             for choice in l])
+        return new_l or None
 
     def add_choice(self, new_choice_value, name=None):
         if self.iscollection:
@@ -406,6 +456,17 @@ class UserDefinedFieldDefinition(models.Model):
 
             self.datatype = json.dumps(datatype)
             self.save()
+
+    @transaction.atomic
+    def replace_collection_field_choices(self, field_name, new_choices):
+        datatypes = {d['name']: d for d in self.datatype_dict}
+        field = datatypes[field_name]
+        for choice in field['choices']:
+            if choice not in new_choices:
+                self.delete_choice(choice, field_name)
+        field['choices'] = new_choices
+        self.datatype = json.dumps(datatypes.values())
+        self.save()
 
     @transaction.atomic
     def update_choice(
@@ -459,22 +520,29 @@ class UserDefinedFieldDefinition(models.Model):
     def validate(self):
         model_type = self.model_type
 
+        if model_type not in {cls.__name__ for cls
+                              in self.instance.editable_udf_models()['all']}:
+            raise ValidationError(
+                {'udf.model': [_("Invalid model '%(model_type)s'") %
+                               {'model_type': model_type}]})
+
         model_class = safe_get_udf_model_class(model_type)
 
         field_names = [field.name for field in model_class._meta.fields]
 
         if self.name in field_names:
             raise ValidationError(
-                {'name': [_('cannot use fields that already '
+                {'name': [_('Cannot use fields that already '
                             'exist on the model')]})
         if not self.name:
             raise ValidationError(
-                {'name': [_('name cannot be blank')]})
+                {'name': [_('Name cannot be blank')]})
 
         if not _UDF_NAME_REGEX.match(self.name):
             raise ValidationError(
-                {'name': [_("A field name may not contain percent (%), "
-                            "period (.) or underscore (_) characters.")]})
+                {'name': [_('A field name may not contain percent (%), '
+                            'period (.), underscore (_), or quote (") '
+                            'characters.')]})
 
         existing_objects = UserDefinedFieldDefinition\
             .objects\
@@ -485,9 +553,12 @@ class UserDefinedFieldDefinition(models.Model):
             .exclude(
                 pk=self.pk)
 
-        if existing_objects.count() != 0:
-            raise ValidationError(_('a field already exists on this model '
-                                    'with that name'))
+        if existing_objects.exists():
+            template = _("There is already a custom %(model_type)s field with"
+                         " name '%(name)s'")
+            raise ValidationError(template % {
+                'model_type': model_class.display_name(self.instance),
+                'name': self.name})
 
         datatype = self.datatype_dict
 
@@ -535,26 +606,27 @@ class UserDefinedFieldDefinition(models.Model):
             raise ValidationError(_('type required data type definition'))
 
         if datatype['type'] not in ['float', 'int', 'string',
-                                    'user', 'choice', 'date']:
+                                    'user', 'choice', 'date',
+                                    'multichoice']:
             raise ValidationError(_('invalid datatype'))
 
-        if datatype['type'] == 'choice':
+        if datatype['type'] in ('choice', 'multichoice'):
             choices = datatype.get('choices', None)
 
             if choices is None:
-                raise ValidationError(_('missing choices key for key'))
+                raise ValidationError(_('Missing choices key'))
 
             for choice in choices:
                 if not isinstance(choice, basestring):
                     raise ValidationError(_('Choice must be a string'))
-                if choice is None or choice == '':
-                    raise ValidationError(_('empty choice not allowed'))
+                if choice is None or choice.strip() == '':
+                    raise ValidationError(_('Empty choice is not allowed'))
 
             if len(choices) == 0:
-                raise ValidationError(_('empty choice list'))
+                raise ValidationError(_('There must be at least one choice'))
 
             if len(choices) != len(set(choices)):
-                raise ValidationError(_('duplicate choices'))
+                raise ValidationError(_('Duplicate choices are not allowed'))
 
         if 'default' in datatype:
             try:
@@ -580,6 +652,20 @@ class UserDefinedFieldDefinition(models.Model):
             Audit.objects.filter(instance=self.instance)\
                          .filter(model='udf:%s' % self.pk)\
                          .delete()
+
+            if 'mobile_api_fields' in self.instance.config:
+                for group in self.instance.mobile_api_fields:
+                    if self.full_name in group.get('collection_udf_keys', []):
+                        # If this is the only collection UDF with this name,
+                        # we remove the entire group, since there would be no
+                        # eligible items to go *in* the group after deletion
+                        if len([udf for udf in udf_defs(self.instance)
+                                if udf.name == self.name]) == 1:
+                            self.instance.mobile_api_fields.remove(group)
+                        # Otherwise, just remove this UDF from the group
+                        else:
+                            group['collection_udf_keys'].remove(self.full_name)
+                    self.instance.save()
         else:
             Model = safe_get_udf_model_class(self.model_type)
             objects_with_udf_data = (Model
@@ -598,11 +684,42 @@ class UserDefinedFieldDefinition(models.Model):
                          .filter(field=self.canonical_name)\
                          .delete()
 
+            save_instance = False
+            # For mobile_api_fields, mobile_search_fields, and search_config
+            # If the field is not in the config, that means the instance is
+            # using the default, which should not be mutated
+            if 'mobile_api_fields' in self.instance.config:
+                for group in self.instance.mobile_api_fields:
+                    if self.full_name in group.get('field_keys', []):
+                        group['field_keys'].remove(self.full_name)
+                        save_instance = True
+
+            if 'search_config' in self.instance.config:
+                for key in (self.model_type, 'missing'):
+                    if key in self.instance.search_config:
+                        self.instance.search_config[key] = [
+                            o for o in self.instance.search_config[key]
+                            if o.get('identifier') != self.full_name]
+                        save_instance = True
+
+            if 'mobile_search_fields' in self.instance.config:
+                for key in ('standard', 'missing'):
+                    if key in self.instance.mobile_search_fields:
+                        self.instance.mobile_search_fields[key] = [
+                            o for o in self.instance.mobile_search_fields[key]
+                            if o.get('identifier') != self.full_name]
+                        save_instance = True
+
+            if save_instance:
+                self.instance.save()
+
         # remove field permissions for this udf
-        FieldPermission.objects.filter(
-            model_name=self.model_type,
-            field_name=self.canonical_name,
-            instance=self.instance).delete()
+        perms = FieldPermission.objects.filter(model_name=self.model_type,
+                                               field_name=self.canonical_name,
+                                               instance=self.instance)
+        # iterating instead of doing a bulk delete in order to trigger signals
+        for perm in perms:
+            perm.delete()
 
         super(UserDefinedFieldDefinition, self).delete(*args, **kwargs)
 
@@ -631,9 +748,13 @@ class UserDefinedFieldDefinition(models.Model):
         if self.datatype_dict['type'] == 'user':
             if hasattr(value, 'pk'):
                 value = str(value.pk)
-
+        elif self.datatype_dict['type'] == 'multichoice':
+            if value and len(value) > 0:
+                value = json.dumps(value, ensure_ascii=False)
+            else:
+                value = None  # so "missing data" searches will work
         if value:
-            return str(value)
+            return value if isinstance(value, unicode) else str(value)
         else:
             return None
 
@@ -692,15 +813,40 @@ class UserDefinedFieldDefinition(models.Model):
                                       {'fieldname': self.name})
 
         elif datatype == 'date':
-            return parse_date_string_with_or_without_time(value)
-        elif datatype == 'choice':
-            if value in datatype_dict['choices']:
+            if isinstance(value, (date, datetime)):
                 return value
-            else:
-                raise ValidationError(
-                    _('Invalid choice (%(given)s). Expecting %(allowed)s') %
-                    {'given': value,
-                     'allowed': ', '.join(datatype_dict['choices'])})
+
+            try:
+                return parse_date_string_with_or_without_time(value)
+            except ValueError:
+                raise ValidationError(_('%(fieldname)s must be formatted as '
+                                        'YYYY-MM-DD') %
+                                      {'fieldname': self.name})
+
+        elif 'choices' in datatype_dict:
+            def _validate(val):
+                if val not in datatype_dict['choices']:
+                    raise ValidationError(
+                        _('Invalid choice (%(given)s). Expecting %(allowed)s')
+                        % {'given': val,
+                           'allowed': ', '.join(datatype_dict['choices'])})
+
+            if datatype == 'choice':
+                _validate(value)
+                return value
+            else:  # 'multichoice'
+                try:
+                    values = json.loads(value)
+                except ValueError:
+                    raise ValidationError(
+                        _('%(fieldname)s must be valid JSON') %
+                        {'fieldname': self.name})
+                if isinstance(values, basestring):
+                    # A single string is valid JSON. Wrap as a list for
+                    # consistency
+                    values = [values]
+                map(_validate, values)
+                return values
         else:
             return value
 
@@ -793,38 +939,16 @@ class UDFDictionary(HStoreDict):
 
         return self._collection_fields
 
-    @property
-    def fields(self):
-        # Django loads fields in the order they're defined on a given
-        # class. For instance,
-        #
-        # class A(models.Model):
-        #   a = models.IntField()
-        #   b = models.IntField()
-        #
-        # Will first load 'a', create the attribute dictionary, add it
-        # to the object and continue.
-        #
-        # Since UDFModel specifies the UDFField first, no other fields
-        # are available on the subclassed object (Plot, Tree, etc) in
-        # the constructor
-        #
-        # The solution is to simply cache the instance and grab the data
-        # in a lazy way
-        if self._fields is None:
-            self._fields = self.instance.get_user_defined_fields()
-
-        return self._fields
-
     def _get_udf_or_error(self, key):
-        for field in self.fields:
+        for field in self.instance.get_user_defined_fields():
             if field.name == key:
                 return field
 
         raise KeyError("Couldn't find UDF for field '%s'" % key)
 
     def __contains__(self, key):
-        return key in [field.name for field in self.fields]
+        return key in [field.name for field
+                       in self.instance.get_user_defined_fields()]
 
     def __getitem__(self, key):
         udf = self._get_udf_or_error(key)
@@ -845,12 +969,11 @@ class UDFDictionary(HStoreDict):
         udf = self._get_udf_or_error(key)
 
         if udf.iscollection:
-            self.instance.dirty_collection_udfs = True
+            self.instance.dirty_collection_udfs[key] = True
             # HStoreDict cleans values in-place, so we need to do a deep-copy
             self.collection_fields[key] = copy.deepcopy(val)
         else:
             val = udf.reverse_clean(val)
-
             super(UDFDictionary, self).__setitem__(key, val)
 
 
@@ -908,9 +1031,6 @@ class _UDFProxy(UDFField):
     def to_python(self, value):
         return value
 
-from south.modelsinspector import add_introspection_rules
-add_introspection_rules([], ["^treemap\.udf\.UDFField"])
-
 
 class UDFModelBase(ModelBase):
 
@@ -958,7 +1078,7 @@ class UDFModel(UserTrackable, models.Model):
                                for udfd in self.collection_udfs}
         self.populate_previous_state()
 
-        self.dirty_collection_udfs = False
+        self.dirty_collection_udfs = {}
 
     def fields_were_updated(self):
         normal_fields = super(UDFModel, self).fields_were_updated()
@@ -982,6 +1102,9 @@ class UDFModel(UserTrackable, models.Model):
 
         all_audits = udf_collection_audits | regular_audits
         return Audit.objects.filter(all_audits).order_by('created')
+
+    def search_slug(self):
+        return to_object_name(self.__class__.__name__)
 
     def collection_udfs_audit_ids(self):
         return self.static_collection_udfs_audit_ids(
@@ -1030,14 +1153,14 @@ class UDFModel(UserTrackable, models.Model):
 
     @property
     def scalar_udf_names_and_fields(self):
-        model_name = self.__class__.__name__.lower()
+        model_name = to_object_name(self.__class__.__name__)
         return [(field.name, model_name + ".udf:" + field.name)
                 for field in self.get_user_defined_fields()
                 if not field.iscollection]
 
     @property
     def collection_udf_names_and_fields(self):
-        model_name = self.__class__.__name__.lower()
+        model_name = to_object_name(self.__class__.__name__)
         return [(field.name, model_name + ".udf:" + field.name)
                 for field in self.collection_udfs]
 
@@ -1068,6 +1191,13 @@ class UDFModel(UserTrackable, models.Model):
                     if udf.canonical_name in visible_fields]
         return self.collection_udfs_audit_names()
 
+    @classproperty
+    def collection_udf_settings(cls):
+        return {
+            k: v for k, v in
+            getattr(cls, 'udf_settings', {}).items()
+            if v.get('iscollection')}
+
     @property
     def tracked_fields(self):
         return super(UDFModel, self).tracked_fields + \
@@ -1083,10 +1213,11 @@ class UDFModel(UserTrackable, models.Model):
 
         base_model_dict = super(UDFModel, self).as_dict(*args, **kwargs)
 
-        for field in self.udf_field_names:
+        for field_obj in self.get_user_defined_fields():
+            field = field_obj.name
             value = self.udfs[field]
 
-            if isinstance(value, list):
+            if field_obj.iscollection:
                 # For colllection UDFs, we need to format each subvalue inside
                 # each dictionary
                 value = [{k: _format_value(val)
@@ -1116,39 +1247,38 @@ class UDFModel(UserTrackable, models.Model):
                   for field in self.get_user_defined_fields()}
 
         for field_name, values in collection_values.iteritems():
-            field = fields[field_name]
+            if self.dirty_collection_udfs.get(field_name):
+                field = fields[field_name]
 
-            ids_specified = []
-            for value_dict in values:
-                if 'id' in value_dict:
-                    id = value_dict['id']
-                    del value_dict['id']
+                ids_specified = []
+                for value_dict in values:
+                    kwargs = {'field_definition': field,
+                              'model_id': self.pk}
+                    if 'id' in value_dict:
+                        id = value_dict['id']
+                        del value_dict['id']
 
-                    udcv = UserDefinedCollectionValue.objects.get(
-                        pk=id,
-                        field_definition=field,
-                        model_id=self.pk)
-                else:
-                    udcv = UserDefinedCollectionValue(
-                        field_definition=field,
-                        model_id=self.pk)
+                        kwargs['pk'] = id
+                        udcv = UserDefinedCollectionValue.objects.get(**kwargs)
+                    else:
+                        udcv = UserDefinedCollectionValue(**kwargs)
 
-                if udcv.data != value_dict:
-                    udcv.data = value_dict
-                    udcv.save_with_user(user)
+                    if udcv.data != value_dict:
+                        udcv.data = value_dict
+                        udcv.save_with_user(user)
 
-                ids_specified.append(udcv.pk)
+                    ids_specified.append(udcv.pk)
 
-            # Delete all values that weren't presented here
-            field.userdefinedcollectionvalue_set\
-                 .filter(model_id=self.pk)\
-                 .exclude(id__in=ids_specified)\
-                 .delete()
+                # Delete all values that weren't presented here
+                field.userdefinedcollectionvalue_set\
+                    .filter(model_id=self.pk)\
+                    .exclude(id__in=ids_specified)\
+                    .delete()
 
         # We need to reload collection UDFs in order to have their IDs set
         self.udfs.force_reload_of_collection_fields()
 
-        self.dirty_collection_udfs = False
+        self.dirty_collection_udfs = {}
 
     def clean_udfs(self):
         scalar_fields = {field.name: field
@@ -1213,12 +1343,49 @@ def quotesingle(string):
     return string.replace("'", "''")
 
 
-def _is_scalar_udf(lvalue):
-    return isinstance(lvalue.col, tuple) and lvalue.col[0] == 'udf'
+UDF_LOOKUP_PATTERN = re.compile(r'(.*?__)?udf\:(.+?)(__[a-zA-z]+)?$')
+UDF_ORDER_PATTERN = re.compile(r'(-?)([a-zA-Z]+)\.udf\:(.+)$')
 
 
-class UDFWhereNode(HStoreGeoWhereNode):
+class UDFBaseContains(Lookup):
+    def as_postgresql(self, compiler, connection):
+        lhs, lhs_params = self.process_lhs(compiler, connection)
+        rhs, rhs_params = self.process_rhs(compiler, connection)
+
+        op = 'LIKE' if self.lookup_name == 'udf_contains' else 'ILIKE'
+
+        if len(rhs_params) == 1 and isinstance(rhs_params[0], dict):
+            param = rhs_params[0]
+            param_keys = list(param.keys())
+            conditions = []
+
+            # Need to wrap every value in percents, since Django isn't
+            # doing it for us
+            values = ['%' + val + '%' for val in param.values()]
+
+            for key in param_keys:
+                conditions.append(
+                    '%s->\'%s\' %s %%s' % (lhs, quotesingle(key), op))
+
+            return (" AND ".join(conditions), values)
+
+        raise ValueError('invalid value')
+
+
+@UDFField.register_lookup
+class UDFContains(UDFBaseContains):
+    lookup_name = 'udf_contains'
+
+
+@UDFField.register_lookup
+class UDFIContains(UDFBaseContains):
+    lookup_name = 'udf_icontains'
+
+
+class UDFQuery(Query):
     """
+    UDF Query encapsulates query compilation changes.
+
     This class allows us to write the where clauses for a
     query that looks something like:
 
@@ -1230,72 +1397,41 @@ class UDFWhereNode(HStoreGeoWhereNode):
     This will allow django-hstore to transform it into SQL similar to:
 
     ("treemap_plot"."udfs"->'Plant Date')::timestamp = '2000-01-02'::timestamp
+
+    Insert text 'bout contains/icontains
+
+    TODO: Is this true?
+    NOTE: This class *must* inherit from Query, not HstoreQuery
+          HStoreQuery will overwrite our WhereNode with it's own
     """
+    def build_filter(self, filter_expr, *args, **kwargs):
+        arg, value = filter_expr
+        match = UDF_LOOKUP_PATTERN.match(arg)
 
-    def add(self, child, *args, **kwargs):
-        """
-        Converts the 'udf:Field Name' syntax to the syntax expected by
-        django-hstore. e.g. filter(**{'udf:Field Name__gt': 17}) will be
-        converted into filter(udfs__gt={'Field Name': 17})
-        """
-        if not isinstance(child, tuple):
-            return super(UDFWhereNode, self).add(child, *args, **kwargs)
-        lvalue, lookup, param = child
+        if match:
+            model, udf_name, lookup = match.groups()
 
-        # contains and icontains are handled below in make_atom
-        if _is_scalar_udf(lvalue) and lookup not in ('contains', 'icontains'):
+            if model is None:
+                model = ''
+
+            # For contains searches on UDFs we need to switch to our custom
+            # lookup class, because django-hstore defines contains as subset
+            #
             # For exact searches on scalar UDFs, we actually want contains,
             # because we don't care about other UDF values
-            if lookup == 'exact':
-                lookup = 'contains'
-            hstore_key = lvalue.col[1]
-            lvalue.col = 'udfs'
+            if lookup == '__contains':
+                lookup = '__udf_contains'
+            elif lookup == '__icontains':
+                lookup = '__udf_icontains'
+            elif lookup is None or lookup == '__exact':
+                lookup = '__contains'
+
+            arg = model + 'udfs' + lookup
             wrapped_param = {}
-            wrapped_param[hstore_key] = param
+            wrapped_param[udf_name] = value
 
-            child = (lvalue, lookup, wrapped_param)
-
-        return super(UDFWhereNode, self).add(child, *args, **kwargs)
-
-    def make_atom(self, child, qn, connection):
-        """
-        django-hstore overloads contains to mean an *exact* search for subsets
-        of key value pairs.  Because of this, to make our udf:field Name syntax
-        work we have to handle generating SQL for contains and icontains here,
-        instead of modifying the query and delegating it to django-hstore
-        """
-        if not isinstance(child, tuple):
-            return super(UDFWhereNode, self).make_atom(child, qn, connection)
-
-        lvalue, lookup, value_annot, value = child
-
-        if _is_scalar_udf(lvalue) and lookup in ('contains', 'icontains'):
-            hstore_key = lvalue.col[1]
-            lvalue.col = 'udfs'
-
-            lvalue, params = lvalue.process(lookup, value, connection)
-            field = self.sql_for_columns(lvalue, qn, connection)
-
-            op = 'LIKE' if lookup == 'contains' else 'ILIKE'
-            sql = '(%s->\'%s\') %s %%s' % (field, hstore_key, op)
-            return (sql, params)
-
-        return super(UDFWhereNode, self).make_atom(child, qn, connection)
-
-UDF_ORDER_PATTERN = re.compile(r'(-?)([a-zA-Z]+)\.udf\:(.+)$')
-
-
-class UDFQuery(GeoQuery):
-    """
-    UDF Query encapsulates query compilation changes. In particular,
-    it injects UDFWhereNode as the default WhereNode type (which can
-    not be overwritten)
-    NOTE: This class *must* inherit from GeoQuery, not HstoreGeoQuery
-          HStoreGeoQuery will overwrite our WhereNode with it's own
-    """
-
-    def __init__(self, model):
-        super(UDFQuery, self).__init__(model, UDFWhereNode)
+            filter_expr = (arg, wrapped_param)
+        return super(UDFQuery, self).build_filter(filter_expr, *args, **kwargs)
 
     def process_as_udf(self, field):
         """
@@ -1365,9 +1501,9 @@ class UDFQuerySet(HStoreGeoQuerySet):
     This class exists mainly to provide an injection point
     for UDFQuery
     """
-    def __init__(self, model=None, query=None, using=None):
+    def __init__(self, model=None, query=None, using=None, hints=None):
         super(UDFQuerySet, self).__init__(
-            model=model, query=query, using=using)
+            model=model, query=query, using=using, hints=hints)
         self.query = query or UDFQuery(model)
 
 

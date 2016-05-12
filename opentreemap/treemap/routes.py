@@ -67,9 +67,9 @@ instances_geojson = do(
     json_api_call,
     misc_views.public_instances_geojson)
 
-error_404_page = render_template('404.html')(statuscode=404)
-error_500_page = render_template('500.html')(statuscode=500)
-error_503_page = render_template('503.html')(statuscode=503)
+error_404_page = misc_views.error_page(status_code=404)
+error_500_page = misc_views.error_page(status_code=500)
+error_503_page = misc_views.error_page(status_code=503)
 
 #####################################
 # utility views
@@ -78,7 +78,7 @@ error_503_page = render_template('503.html')(statuscode=503)
 root_settings_js = render_template('treemap/settings.js')(
     {'BING_API_KEY':
      settings.BING_API_KEY},
-    mimetype='application/javascript')
+    content_type='application/javascript')
 
 instance_settings_js = instance_request(root_settings_js)
 
@@ -129,13 +129,13 @@ map_feature_detail = do(
 map_feature_accordion = do(
     instance_request,
     render_template('treemap/partials/map_feature_accordion.html'),
-    feature_views.map_feature_detail)
+    feature_views.context_map_feature_detail)
 
 get_map_feature_sidebar = do(
     instance_request,
     etag(feature_views.map_feature_hash),
     render_template('treemap/partials/sidebar.html'),
-    feature_views.map_feature_detail)
+    feature_views.context_map_feature_detail)
 
 map_feature_popup = do(
     instance_request,
@@ -167,17 +167,16 @@ unfavorite_map_feature = do(
     json_api_edit,
     feature_views.unfavorite_map_feature)
 
+edit_map_feature_detail = do(
+    login_required,
+    instance_request,
+    creates_instance_user,
+    feature_views.render_map_feature_detail)
+
 
 #####################################
 # plot
 #####################################
-
-edit_plot_detail = do(
-    login_required,
-    instance_request,
-    creates_instance_user,
-    render_template('treemap/plot_detail.html'),
-    feature_views.plot_detail)
 
 get_plot_eco = do(
     instance_request,
@@ -258,13 +257,8 @@ photo_review_partial = do(
     render_template('treemap/partials/photo_review.html'),
     photo_views.photo_review)
 
-next_photo = do(
-    require_http_method("GET"),
-    admin_instance_request,
-    render_template('treemap/partials/photo.html'),
-    photo_views.next_photo)
-
-approve_or_reject_photo = do(
+approve_or_reject_photos = do(
     require_http_method("POST"),
     admin_instance_request,
-    photo_views.approve_or_reject_photo)
+    render_template('treemap/partials/photo_review.html'),
+    photo_views.approve_or_reject_photos)

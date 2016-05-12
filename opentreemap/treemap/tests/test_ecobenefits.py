@@ -5,6 +5,9 @@ from __future__ import division
 
 import json
 
+from django.core.cache import cache
+from django.test import override_settings
+
 from treemap.models import Plot, Tree, Species, ITreeRegion
 from treemap.tests import make_instance, make_commander_user, make_request
 from treemap.tests.test_urls import UrlTestCase
@@ -13,10 +16,10 @@ from treemap import ecobackend
 from treemap.ecobenefits import (TreeBenefitsCalculator,
                                  _combine_benefit_basis,
                                  _annotate_basis_with_extra_stats,
-                                 _combine_grouped_benefits)
-
-from treemap.ecobenefits import BenefitCategory
+                                 _combine_grouped_benefits, BenefitCategory)
 from treemap.views.tree import search_tree_benefits
+from treemap.search import Filter
+from treemap.ecocache import get_cached_benefits, get_cached_plot_count
 
 
 class EcoTest(UrlTestCase):
@@ -91,10 +94,10 @@ class EcoTest(UrlTestCase):
 
         self.assert_benefit_value(bens, BenefitCategory.ENERGY, 'kwh', 1896)
         self.assert_benefit_value(bens, BenefitCategory.AIRQUALITY,
-                                  'lbs/year', 6)
+                                  'lbs', 6)
         self.assert_benefit_value(bens, BenefitCategory.STORMWATER,
                                   'gal', 3185)
-        self.assert_benefit_value(bens, BenefitCategory.CO2, 'lbs/year', 563)
+        self.assert_benefit_value(bens, BenefitCategory.CO2, 'lbs', 563)
         self.assert_benefit_value(bens, BenefitCategory.CO2STORAGE,
                                   'lbs', 6575)
 
@@ -326,3 +329,51 @@ class EcoTest(UrlTestCase):
         _annotate_basis_with_extra_stats(basis)
 
         self.assertEqual(basis, target)
+
+
+@override_settings(USE_ECO_CACHE=True)
+class EcoCacheTest(UrlTestCase):
+    def setUp(self):
+        self.instance = make_instance()
+        self.user = make_commander_user(self.instance)
+        self.benefits = 'some benefits'
+        self.filter = Filter('', '', self.instance)
+
+    def tearDown(self):
+        cache.clear()
+
+    def get_cached_tree_benefits(self, filter, fn):
+        return get_cached_benefits('Plot', filter, fn)
+
+    def test_benefits_are_cached(self):
+        self.get_cached_tree_benefits(self.filter, lambda: self.benefits)
+        benefits = self.get_cached_tree_benefits(self.filter, lambda: 'others')
+        self.assertEqual(benefits, self.benefits)
+
+    def test_updating_eco_rev_busts_benefit_cache(self):
+        self.get_cached_tree_benefits(self.filter, lambda: self.benefits)
+        self.filter.instance.update_eco_rev()
+        benefits = self.get_cached_tree_benefits(self.filter, lambda: 'others')
+        self.assertEqual(benefits, 'others')
+
+    def test_count_is_cached(self):
+        count = get_cached_plot_count(self.filter)
+        self.assertEqual(0, count)
+
+        # We save with the old
+        plot = Plot(geom=self.instance.center, instance=self.instance)
+        plot.save_with_user(self.user)
+
+        count = get_cached_plot_count(self.filter)
+        self.assertEqual(0, count)
+
+    def test_updating_geo_rev_busts_count_cache(self):
+        count = get_cached_plot_count(self.filter)
+        self.assertEqual(0, count)
+
+        plot = Plot(geom=self.instance.center, instance=self.instance)
+        plot.save_with_user(self.user)
+        self.filter.instance.update_geo_rev()
+
+        count = get_cached_plot_count(self.filter)
+        self.assertEqual(1, count)

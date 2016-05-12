@@ -60,6 +60,9 @@ class CommentReviewUITest(CommentTestMixin, TreemapUITestCase):
     def go_to_page(self, page_num):
         page = str(page_num)
         page_link = self.find('.pagination').find_element_by_link_text(page)
+
+        self.driver.execute_script("return arguments[0].scrollIntoView();",
+                                   page_link)
         page_link.click()
 
         self.wait_until_on_page(page_num)
@@ -156,7 +159,7 @@ class CommentReviewUITest(CommentTestMixin, TreemapUITestCase):
         for checkbox in checkboxes:
             self.assertFalse(checkbox.is_selected())
 
-        batch_checkbox = self.find('[data-comment-toggle-all]')
+        batch_checkbox = self.find('[data-toggle-all]')
         batch_checkbox.click()
 
         for checkbox in checkboxes:
@@ -167,7 +170,7 @@ class CommentReviewUITest(CommentTestMixin, TreemapUITestCase):
         # Open the batch action dropdown
         self.click('[data-comment-batch-dropdown]')
 
-        self.find('[data-comment-batch]') \
+        self.find('[data-batch-action]') \
             .find_element_by_link_text('Archive') \
             .click()
 
@@ -206,7 +209,7 @@ class CommentUITest(CommentTestMixin, TreemapUITestCase):
 
         sleep(3)
         comment_obj = EnhancedThreadedComment.objects.get(
-            object_pk=self.plot.pk, content_type__name='plot')
+            object_pk=self.plot.pk, content_type__model='plot')
         self.assertEqual(comment_obj.comment, comment_text)
         self.assertCommentText(comment_obj.pk, comment_text)
 

@@ -5,11 +5,11 @@ var $ = require('jquery'),
     toastr = require('toastr'),
     inlineEditForm = require('treemap/inlineEditForm'),
     MapManager = require('treemap/MapManager'),
+    R = require('ramda'),
     BU = require('treemap/baconUtils'),
     Bacon = require('baconjs'),
     U = require('treemap/utility'),
-    plotMover = require('treemap/plotMover'),
-    plotDelete = require('treemap/plotDelete'),
+    geometryMover = require('treemap/geometryMover'),
     plotMarker = require('treemap/plotMarker'),
     statePrompter = require('treemap/statePrompter'),
     csrf = require('treemap/csrf'),
@@ -18,7 +18,6 @@ var $ = require('jquery'),
     reverseGeocodeStreamAndUpdateAddressesOnForm =
         require('treemap/reverseGeocodeStreamAndUpdateAddressesOnForm'),
     streetView = require('treemap/streetView'),
-    History = require('history'),
     alerts = require('treemap/alerts'),
 
     dom = {
@@ -49,23 +48,17 @@ exports.init = function(options) {
         $(window).asEventStream('popstate')
             .map(function() { return U.getLastUrlSegment() === 'edit'; }));
 
+    var currentMover;
+
     var form = inlineEditForm.init(
             _.extend(options.inlineEditForm,
                      { config: options.config,
                        updateUrl: detailUrl,
-                       onSaveBefore: onSaveBefore,
                        shouldBeInEditModeStream: shouldBeInEditModeStream,
-                       errorCallback: alerts.makeErrorCallback(options.config)
+                       errorCallback: alerts.makeErrorCallback(options.config),
+                       onSaveBefore: function (data) { currentMover.onSaveBefore(data); },
+                       onSaveAfter: function (data) { currentMover.onSaveAfter(data); }
                      }));
-
-    var deleter = plotDelete.init({
-        config: options.config,
-        delete: options.delete,
-        deleteConfirm: options.deleteConfirm,
-        deleteCancel: options.deleteCancel,
-        deleteConfirmationBox: options.deleteConfirmationBox,
-        treeIdColumn: options.treeIdColumn
-    });
 
     if (options.config.instance.supportsEcobenefits) {
         var updateEcoUrl = U.appendSegmentToUrl('eco', detailUrl);
@@ -86,12 +79,12 @@ exports.init = function(options) {
         if (inEditMode) {
             prompter.lock();
             if (!hrefHasEdit) {
-                History.replaceState(null, document.title, U.appendSegmentToUrl('edit'));
+                history.replaceState(null, document.title, U.appendSegmentToUrl('edit'));
             }
         } else {
             prompter.unlock();
             if (hrefHasEdit) {
-                History.replaceState(null, document.title, U.removeLastUrlSegment());
+                history.replaceState(null, document.title, U.removeLastUrlSegment());
             }
         }
     });
@@ -113,20 +106,26 @@ exports.init = function(options) {
         zoom: mapManager.ZOOM_PLOT
     });
 
-    plotMarker.init(options.config, mapManager.map);
-    plotMarker.useTreeIcon(options.useTreeIcon);
-
-    reverseGeocodeStreamAndUpdateAddressesOnForm(
-        options.config, plotMarker.moveStream, options.form);
-
-    var currentPlotMover = plotMover.init({
+    var moverOptions = {
         mapManager: mapManager,
-        plotMarker: plotMarker,
         inlineEditForm: form,
         editLocationButton: options.location.edit,
         cancelEditLocationButton: options.location.cancel,
-        location: options.location.point
-    });
+        location: options.location,
+        config: options.config,
+        resourceType: options.resourceType
+    };
+
+    if (options.isEditablePolygon) {
+        currentMover = geometryMover.polygonMover(moverOptions);
+    } else {
+        plotMarker.init(options.config, mapManager.map);
+        plotMarker.useTreeIcon(options.useTreeIcon);
+        reverseGeocodeStreamAndUpdateAddressesOnForm(
+            options.config, plotMarker.moveStream, options.form);
+        moverOptions.plotMarker = plotMarker;
+        currentMover = geometryMover.plotMover(moverOptions);
+    }
 
     var detailUrlPrefix = U.removeLastUrlSegment(detailUrl),
         clickedIdStream = mapManager.map.utfEvents
@@ -136,11 +135,8 @@ exports.init = function(options) {
     clickedIdStream
         .filter(BU.not, options.featureId)
         .map(_.partialRight(U.appendSegmentToUrl, detailUrlPrefix, false))
+        .filter(R.not(currentMover.isEnabled))
         .onValue(_.bind(window.location.assign, window.location));
-
-    function onSaveBefore(data) {
-        currentPlotMover.onSaveBefore(data);
-    }
 
     if (options.config.instance.basemap.type === 'google') {
         var $streetViewContainer = $(options.streetView);

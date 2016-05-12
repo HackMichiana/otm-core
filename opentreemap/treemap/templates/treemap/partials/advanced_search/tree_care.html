@@ -1,0 +1,77 @@
+{% extends "treemap/partials/advanced_search/dropdown.html" %}
+{% load i18n %}
+{% load instance_config %}
+{% load util %}
+
+{% block title %}
+    {% trans "Tree Care" %}
+{% endblock %}
+
+{% block dropdown_content %}
+
+{# Note: "udfc_search_data" and "udfc" are defined in the template that includes this one. #}
+
+<div class="udfc-search clearfix">
+  <span>{% trans "I am looking for" %}</span>
+  <label class="udfc-label">
+    <select id="udfc-search-model">
+      <option data-class="udfc-placeholder" selected />
+      {% for model in udfc_search_data.models %}
+      {% with terminology=model|terminology:request.instance %}
+      <option data-model="{{ model.search_slug }}">{{ terminology.plural.lower }}</option>
+      {% endwith %}
+      {% endfor %}
+    </select>
+  </label>
+
+  <label class="udfc-label">
+    <select id="udfc-search-type">
+      <option data-class="udfc-placeholder" selected />
+      {% for udfd_name, udfd_data in udfc.items %}
+      <option data-type="{{ udfd_name }}"
+              data-udfd-ids="{{ udfd_data.ids|as_json }}"
+              data-date-field-key="{{ udfd_data.range_field_key }}"
+              data-action-field-key="{{ udfd_data.action_field_key }}"
+              >{{ udfd_data.action_verb }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <div id="udfc-extra-clauses" style="display: none">
+    {% if alerts in udfc %}
+    <input id="alerts-resolved"
+           data-type="alerts"
+           data-field="Status"
+           data-search-type="IS"
+           value="Unresolved"/>
+    {% endif %}
+  </div>
+
+
+  <label class="udfc-label">
+    <select id="udfc-search-action" data-search-type="IS">
+      <option data-class="udfc-placeholder" selected />
+      {% for udfd_name, udfd_data in udfc.items %}
+      {% for model_name, model_data in udfd_data.models.items %}
+      {% for action in model_data.fields %}
+      <option data-model="{{ model_name }}" data-type="{{ udfd_name }}">{{ action }}</option>
+      {% endfor %}
+      {% endfor %}
+      {% endfor %}
+    </select>
+  </label>
+
+  <span>{% trans "between" %}</span>
+  <input id="udfc-search-date-from" data-search-type="MIN"
+         class="udfc-selector"
+         {% include "treemap/partials/date_picker_init.html" %}
+         />
+  <span>{% trans "and" %}</span>
+  <input id="udfc-search-date-to" data-search-type="MAX"
+         class="udfc-selector"
+         {% include "treemap/partials/date_picker_init.html" %}
+         />
+
+</div>
+
+{% endblock %}

@@ -5,6 +5,8 @@ from __future__ import division
 
 import json
 import copy
+
+from operator import itemgetter
 from functools import wraps
 
 from django.db.models import Q
@@ -12,27 +14,30 @@ from django.db.models import Q
 from django.conf import settings
 from django.contrib.gis.geos import Point
 from django.contrib.gis.measure import D
+from django.utils.translation import ugettext as _
 
 from django_tinsel.exceptions import HttpBadRequestException
 from treemap.lib.object_caches import role_permissions
 from treemap.models import Instance, InstanceUser
 from treemap.units import (get_units_if_convertible, get_digits_if_formattable,
-                           get_conversion_factor)
+                           storage_to_instance_units_factor)
 from treemap.util import safe_get_model_class
 from treemap.templatetags.form_extras import field_type_label_choices
 from treemap.json_field import is_json_field_reference
-from treemap.plugin import get_mobile_instances_filter
+from treemap.plugin import get_viewable_instances_filter
 from treemap.ecobenefits import BenefitCategory
+from treemap.search_fields import mobile_search_fields
 
 import treemap.lib.perms as perms_lib
 
 
 def transform_instance_info_response(instance_view_fn):
     """
-    Collection UDFs were added to the API in version 3
+    Removes some information from the instance info response for older APIs
 
-    They need to be removed in older versions of the API, to support clients
-    which can not render collection UDFs
+    v3 - Collection UDFs added
+    v4 - Multiselect fields added and new search options added
+    v5 - universalRev added
     """
     @wraps(instance_view_fn)
     def wrapper(request, *args, **kwargs):
@@ -43,6 +48,34 @@ def transform_instance_info_response(instance_view_fn):
                 [field_group for field_group
                  in instance_info_dict['field_key_groups']
                  if 'collection_udf_keys' not in field_group]
+
+        if request.api_version < 4:
+            multichoice_fields = {
+                field for field, info
+                in instance_info_dict['fields'].iteritems()
+                if info['data_type'] == 'multichoice'}
+
+            # Remove multichoice fields from perms
+            instance_info_dict['fields'] = {
+                field: info for field, info
+                in instance_info_dict['fields'].iteritems()
+                if field not in multichoice_fields}
+
+            # Remove multichoice fields from field groups
+            for group in instance_info_dict['field_key_groups']:
+                if 'field_keys' in group:
+                    group['field_keys'] = [key for key in group['field_keys']
+                                           if key not in multichoice_fields]
+
+            # Remove all standard searches that are not species, range, or bool
+            instance_info_dict['search']['standard'] = [
+                field for field in instance_info_dict['search']['standard']
+                if field['search_type'] in {'SPECIES', 'RANGE', 'BOOL'}]
+
+        if request.api_version < 5:
+            instance_info_dict['geoRevHash'] = (
+                instance_info_dict['universalRevHash'])
+            del instance_info_dict['universalRevHash']
 
         return instance_info_dict
 
@@ -85,20 +118,28 @@ def instances_closest_to_point(request, lat, lng):
             'The distance parameter must be a number')
 
     instances = Instance.objects \
-                        .filter(get_mobile_instances_filter()) \
-                        .distance(point) \
-                        .order_by('distance')
-
-    nearby_predicate = Q(bounds__distance_lte=(point, D(m=distance)))
+                        .filter(get_viewable_instances_filter())
     personal_predicate = Q(pk__in=user_instance_ids)
 
+    def get_annotated_contexts(instances):
+        results = []
+        for instance in instances:
+            instance_info = _instance_info_dict(instance)
+            d = D(m=point.distance(instance.bounds.geom)).km
+            instance_info['distance'] = d
+            results.append(instance_info)
+        return sorted(results, key=itemgetter('distance'))
+
     return {
-        'nearby': _contextify_instances(instances
-                                        .filter(is_public=True)
-                                        .filter(nearby_predicate)
-                                        .exclude(personal_predicate)
-                                        [0:max_instances]),
-        'personal': _contextify_instances(instances.filter(personal_predicate))
+        'nearby': get_annotated_contexts(
+            instances
+            .filter(is_public=True)
+            .filter(bounds__geom__distance_lte=(
+                point, D(m=distance)))
+            .exclude(personal_predicate)
+            [0:max_instances]),
+        'personal': get_annotated_contexts(
+            instances.filter(personal_predicate))
     }
 
 
@@ -118,8 +159,7 @@ def instance_info(request, instance):
         if instance_user:
             role = instance_user.role
 
-    collection_udfs = instance.userdefinedfielddefinition_set\
-                              .filter(iscollection=True)
+    collection_udfs = instance.collection_udfs
     collection_udf_dict = {"%s.%s" % (udf.model_type.lower(),
                                       udf.canonical_name): udf
                            for udf in collection_udfs}
@@ -153,7 +193,7 @@ def instance_info(request, instance):
             factor = 1.0
 
             try:
-                factor = get_conversion_factor(
+                factor = storage_to_instance_units_factor(
                     instance, model, fp.field_name)
             except KeyError:
                 pass
@@ -183,6 +223,9 @@ def instance_info(request, instance):
     mobile_api_fields = copy.deepcopy(instance.mobile_api_fields)
 
     for field_group in mobile_api_fields:
+        # Field group headers are stored in English, and translated when they
+        # are sent out to the client
+        field_group['header'] = _(field_group['header'])
         key = get_key_for_group(field_group)
         if key:
             field_group[key] = [field for field in field_group[key]
@@ -194,7 +237,7 @@ def instance_info(request, instance):
     info = _instance_info_dict(instance)
     info['fields'] = perms
     info['field_key_groups'] = readable_mobile_api_fields
-    info['search'] = instance.mobile_search_fields
+    info['search'] = mobile_search_fields(instance)
     info['date_format'] = _unicode_dateformat(instance.date_format)
     info['short_date_format'] = _unicode_dateformat(instance.short_date_format)
 
@@ -219,7 +262,7 @@ def instance_info(request, instance):
 def public_instances(request):
     return _contextify_instances(Instance.objects
                                  .filter(is_public=True)
-                                 .filter(get_mobile_instances_filter()))
+                                 .filter(get_viewable_instances_filter()))
 
 
 def _contextify_instances(instances):
@@ -230,7 +273,7 @@ def _contextify_instances(instances):
 def _instance_info_dict(instance):
     center = instance.center
     center.transform(4326)
-    bounds = instance.bounds
+    bounds = instance.bounds.geom
     bounds.transform(4326)
     extent = bounds.extent
     p1 = Point(float(extent[0]), float(extent[1]), srid=4326)
@@ -240,6 +283,7 @@ def _instance_info_dict(instance):
     extent_radius = p1.distance(p2) / 2
 
     info = {'geoRevHash': instance.geo_rev_hash,
+            'universalRevHash': instance.universal_rev_hash,
             'id': instance.pk,
             'url': instance.url_name,
             'name': instance.name,
@@ -252,9 +296,6 @@ def _instance_info_dict(instance):
             'extent_radius': extent_radius,
             'eco': _instance_eco_dict(instance)
             }
-
-    if hasattr(instance, 'distance'):
-        info['distance'] = instance.distance.km
 
     return info
 

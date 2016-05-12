@@ -26,11 +26,11 @@ def _template_api_call(verb, template, view_fn):
 list_imports = _template_api_call(
     'GET', 'importer/partials/imports.html', views.list_imports)
 
-refresh_imports = _template_api_call(
-    'GET', 'importer/partials/import_tables.html', views.list_imports)
+get_import_table = _template_api_call(
+    'GET', 'importer/partials/import_table.html', views.get_import_table)
 
 start_import = _template_api_call(
-    'POST', 'importer/partials/imports.html', views.start_import)
+    'POST', 'importer/partials/import_table.html', views.start_import)
 
 cancel = _template_api_call(
     'GET', 'importer/partials/imports.html', views.cancel)
@@ -50,5 +50,8 @@ export_all_species = _api_call('GET', json_api_call(views.export_all_species))
 
 export_single_import = _api_call(
     'GET', json_api_call(views.export_single_import))
+
+download_import_template = _api_call(
+    'GET', views.download_import_template)
 
 merge_species = _api_call('POST', views.merge_species)

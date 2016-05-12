@@ -2,6 +2,8 @@ from __future__ import print_function
 from __future__ import unicode_literals
 from __future__ import division
 
+import json
+
 from django import template
 from treemap.json_field import get_attr_from_json_field
 from treemap.lib import perms
@@ -44,11 +46,30 @@ def instance_config(instance, field):
     else:
         return None
 
+
+@register.filter
+def get_advanced_search_fields(instance, user):
+    return instance.advanced_search_fields(user)
+
+
+@register.filter
+def get_udfc_search_fields(instance, user):
+    return instance.get_udfc_search_fields(user)
+
+
+@register.filter
+def as_json(d):
+    return json.dumps(d)
+
 udf_write_level = register.filter(perms.udf_write_level)
 geom_is_writable = register.filter(perms.geom_is_writable)
+map_feature_is_writable = register.filter(perms.map_feature_is_writable)
+map_feature_is_deletable = register.filter(perms.map_feature_is_deletable)
 plot_is_writable = register.filter(perms.plot_is_writable)
 is_deletable = register.filter(perms.is_deletable)
 is_read_or_write = register.filter(perms.is_read_or_write)
 treephoto_is_writable = register.filter(perms.treephoto_is_writable)
 mapfeaturephoto_is_writable = register.filter(
     perms.mapfeaturephoto_is_writable)
+any_resource_is_creatable = register.filter(perms.any_resource_is_creatable)
+plot_is_creatable = register.filter(perms.plot_is_creatable)

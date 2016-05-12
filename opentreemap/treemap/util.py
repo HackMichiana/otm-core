@@ -7,17 +7,15 @@ import datetime
 from collections import OrderedDict
 
 from urlparse import urlparse
+
+from django.apps import apps
 from django.shortcuts import get_object_or_404, resolve_url
 from django.http import HttpResponse
-from django.utils.encoding import force_str, force_text
-from django.utils.functional import Promise
-from django.core.serializers.json import DjangoJSONEncoder
+from django.utils.encoding import force_str
 from django.contrib.auth import REDIRECT_FIELD_NAME
 from django.conf import settings
 from django.core.exceptions import ValidationError, MultipleObjectsReturned
 from django.utils.translation import ugettext_lazy as _
-from django.db.models.fields.files import ImageFieldFile
-from django.contrib.gis.geos import Point
 
 from opentreemap.util import dict_pop
 from treemap.instance import Instance
@@ -46,6 +44,15 @@ def safe_get_model_class(model_string):
     else:
         raise ValidationError(
             _('invalid model type: "%s"') % model_string)
+
+
+def get_model_for_instance(object_name, instance=None):
+    Model = safe_get_model_class(to_model_name(object_name))
+
+    if instance and hasattr(Model, 'instance'):
+        return Model(instance=instance)
+    else:
+        return Model()
 
 
 def add_visited_instance(request, instance):
@@ -127,57 +134,48 @@ def package_field_errors(model_name, validation_error):
     return dict
 
 
-# https://docs.djangoproject.com/en/dev/topics/serialization/#id2
-class LazyEncoder(DjangoJSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, Promise):
-            return force_text(obj)
-        elif hasattr(obj, 'dict'):
-            return obj.dict()
-        elif isinstance(obj, set):
-            return list(obj)
-        elif hasattr(obj, 'as_dict'):
-            return obj.as_dict()
-        elif isinstance(obj, Point):
-            srid = 4326
-            obj.transform(srid)
-            return {'x': obj.x, 'y': obj.y, 'srid': srid}
-        # TODO: Handle S3
-        elif isinstance(obj, ImageFieldFile):
-            if obj:
-                return obj.url
-            else:
-                return None
-        else:
-            return super(LazyEncoder, self).default(obj)
-
-
-def all_subclasses(cls):
-    """Return all subclasses of given class"""
+def _all_subclasses(cls):
     subclasses = set(cls.__subclasses__())
-    return subclasses | {clz for s in subclasses for clz in all_subclasses(s)}
+    return subclasses | {clz for s in subclasses for clz in _all_subclasses(s)}
 
 
-def leaf_subclasses(cls):
-    """Return all leaf subclasses of given class"""
-    all = all_subclasses(cls)
+def all_models_of_class(cls):
+    """Return all Django models which are subclasses of given class"""
+    # During unit tests many of the subclasses we see will be historical models
+    # created by the migration system
+    # We only look at subclasses of real Django models in order to exclude them
+    all_models = set(apps.get_models())
+    return all_models & _all_subclasses(cls)
+
+
+def leaf_models_of_class(cls):
+    """Return all Django models which are leaf subclasses of given class"""
+    all = all_models_of_class(cls)
     leaves = {s for s in all if not s.__subclasses__()}
     return leaves
 
 
 def to_object_name(model_name):
-    """BenefitCurrencyConversion -> benefitCurrencyConversion"""
+    """BenefitCurrencyConversion -> benefitCurrencyConversion
+
+    works idempotently, eg:
+    benefitCurrencyConversion -> benefitCurrencyConversion
+    """
     return model_name[0].lower() + model_name[1:]
 
 
 def to_model_name(object_name):
-    """benefitCurrencyConversion -> BenefitCurrencyConversion"""
+    """benefitCurrencyConversion -> BenefitCurrencyConversion
+
+    works idempotently, eg:
+    BenefitCurrencyConversion -> BenefitCurrencyConversion
+    """
     return object_name[0].upper() + object_name[1:]
 
 
 def get_filterable_audit_models():
     from treemap.models import MapFeature
-    map_features = [c.__name__ for c in leaf_subclasses(MapFeature)]
+    map_features = [c.__name__ for c in leaf_models_of_class(MapFeature)]
     models = map_features + ['Tree']
 
     return {model.lower(): model for model in models}

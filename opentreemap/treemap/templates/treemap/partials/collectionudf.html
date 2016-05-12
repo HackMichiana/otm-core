@@ -1,16 +1,21 @@
 {% load i18n %}
 {% load l10n %}
 {% load util %}
+{% load form_extras %}
 {% load instance_config %}
 
 {% with perm_level=last_effective_instance_user|udf_write_level:udf %}
 {% if perm_level|is_read_or_write %}
 <div>
-  <h4>{{ udf.model_type|display_name }} {{ udf.name }}</h4>
+  {% if title_prefix %}
+  <h4>{{ title_prefix }} {{ udf.name }}</h4>
+  {% else %}
+  <h4>{{ udf.name }}</h4>
+  {% endif %}
   <table class="table table-hover"
          {% if perm_level == "write" %}
          data-udf-id="{{ udf.pk|unlocalize }}"
-         data-udf-name="{{ udf.model_type.lower }}.{{ udf.canonical_name }}"
+         data-udf-name="{{ udf.model_type|to_object_name }}.{{ udf.canonical_name }}"
          {% endif %}
          >
     <tr class="headerrow"
@@ -40,6 +45,11 @@
     {% endfor %}
     <tr class="placeholder" style="{{ values|yesno:"display: none;," }}"><td>{% trans "No entries yet!" %}</td>
   </table>
+  {% if udf.model_config.warning_message %}
+  <p class="text-muted">
+    <em>{{ udf.model_config.warning_message }}</em>
+  </p>
+  {% endif %}
 </div>
 {% endif %}
 {% endwith %}

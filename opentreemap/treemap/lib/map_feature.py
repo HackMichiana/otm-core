@@ -7,23 +7,28 @@ import datetime
 
 from django.conf import settings
 from django.core.urlresolvers import reverse
+from django.core.exceptions import PermissionDenied
+from django.http import Http404
 from django.shortcuts import get_object_or_404
 from django.utils.formats import number_format
 from django.utils.translation import ugettext as _
 from django.db.models import Q
 
 from treemap.audit import Audit
-from treemap.ecobackend import ECOBENEFIT_ERRORS
+from treemap.ecobackend import ECOBENEFIT_FAILURE_CODES_AND_PATTERNS
 from treemap.lib import execute_sql
 from treemap.models import Tree, MapFeature, User, Favorite
 
 from treemap.lib import format_benefits
 from treemap.lib.photo import context_dict_for_photo
-from treemap.util import leaf_subclasses
+from treemap.util import leaf_models_of_class, to_object_name
+
+from stormwater.models import PolygonalMapFeature
 
 
 def _photo_upload_share_text(feature, has_tree=False):
-    return _("I added a photo of this %s!") % feature.display_name.lower()
+    return (_("I added a photo of this %s!") %
+            feature.display_name(feature.instance).lower())
 
 
 def _map_feature_audits(user, instance, feature, filters=None,
@@ -74,15 +79,12 @@ def _map_feature_audits(user, instance, feature, filters=None,
 def _add_eco_benefits_to_context_dict(instance, feature, context):
     FeatureClass = feature.__class__
 
-    if not hasattr(FeatureClass, 'benefits'):
-        return
+    benefits, basis, failure_code = FeatureClass.benefits\
+                                                .benefits_for_object(
+                                                    instance, feature)
 
-    benefits, basis, error = FeatureClass.benefits\
-                                         .benefits_for_object(
-                                             instance, feature)
-
-    if error in ECOBENEFIT_ERRORS:
-        context[error] = True
+    if failure_code in ECOBENEFIT_FAILURE_CODES_AND_PATTERNS:
+        context[failure_code] = True
     elif benefits:
         context.update(format_benefits(instance, benefits, basis))
 
@@ -151,8 +153,14 @@ def _add_audits_to_context(audits, context):
         context['latest_update'] = None
 
 
+def raise_non_instance_404(class_name):
+    raise Http404('Instance does not support feature type %s' % class_name)
+
+
 def get_map_feature_or_404(feature_id, instance, type=None):
     if type:
+        if type not in instance.map_feature_types:
+            raise_non_instance_404(type)
         MapFeatureSubclass = MapFeature.get_subclass(type)
         InstanceMapFeature = instance.scope_model(MapFeatureSubclass)
         return get_object_or_404(InstanceMapFeature, pk=feature_id)
@@ -162,14 +170,15 @@ def get_map_feature_or_404(feature_id, instance, type=None):
         feature = get_object_or_404(InstanceMapFeature, pk=feature_id)
 
         # Return the concrete subtype (e.g. Plot), not a general MapFeature
-        return feature.cast_to_subtype()
+        typed_feature = feature.cast_to_subtype()
+        class_name = typed_feature.__class__.__name__
+        if class_name not in instance.map_feature_types:
+            raise_non_instance_404(class_name)
+        return typed_feature
 
 
-def context_dict_for_plot(request, plot, edit=False, tree_id=None):
-    context = context_dict_for_map_feature(request, plot)
-
-    if edit:
-        context['editmode'] = edit
+def context_dict_for_plot(request, plot, tree_id=None, **kwargs):
+    context = context_dict_for_map_feature(request, plot, **kwargs)
 
     instance = request.instance
     user = request.user
@@ -240,6 +249,11 @@ def context_dict_for_plot(request, plot, edit=False, tree_id=None):
     context['photo_upload_share_text'] = _photo_upload_share_text(
         plot, tree is not None)
 
+    pmfs = PolygonalMapFeature.objects.filter(polygon__contains=plot.geom)
+
+    if pmfs:
+        context['containing_polygonalmapfeature'] = pmfs[0].cast_to_subtype()
+
     audits = _plot_audits(user, instance, plot)
 
     _add_audits_to_context(audits, context)
@@ -249,8 +263,8 @@ def context_dict_for_plot(request, plot, edit=False, tree_id=None):
     return context
 
 
-def context_dict_for_resource(request, resource):
-    context = context_dict_for_map_feature(request, resource)
+def context_dict_for_resource(request, resource, **kwargs):
+    context = context_dict_for_map_feature(request, resource, **kwargs)
     instance = request.instance
 
     # Give them 2 for adding the resource and answering its questions
@@ -284,30 +298,31 @@ def context_dict_for_resource(request, resource):
 
     _add_share_context(context, request, photos)
 
+    object_name_alias = to_object_name(context['feature'].__class__.__name__)
+    # some features that were originally written to support plot and tree
+    # have grown to support other resource types, but they expect a context
+    # entry for their type, not just for 'feature'.
+    # For example:
+    # * Plot detail expects 'plot' and 'tree'
+    # * Foo detail would expect 'foo'
+    context[object_name_alias] = context['feature']
+
+    if isinstance(resource, PolygonalMapFeature):
+        context['contained_plots'] = resource.contained_plots()
+
     return context
 
 
-def title_for_map_feature(feature):
-    # Cast allows the map feature subclass to handle generating
-    # the display name
-    feature = feature.cast_to_subtype()
+def context_dict_for_map_feature(request, feature, edit=False):
+    context = {}
 
-    if feature.is_plot:
-        tree = feature.current_tree()
-        if tree:
-            if tree.species:
-                title = tree.species.common_name
-            else:
-                title = _("Missing Species")
+    if edit:
+        if feature.is_plot or getattr(feature, 'is_editable', False):
+            context['editmode'] = edit
         else:
-            title = _("Empty Planting Site")
-    else:
-        title = feature.display_name
+            raise PermissionDenied("Cannot edit '%s' objects"
+                                   % feature.feature_type)
 
-    return title
-
-
-def context_dict_for_map_feature(request, feature):
     instance = request.instance
     if instance.pk != feature.instance_id:
         raise Exception("Invalid instance, does not match map feature")
@@ -324,17 +339,17 @@ def context_dict_for_map_feature(request, feature):
 
     feature.convert_to_display_units()
 
-    context = {
+    context.update({
         'feature': feature,
         'feature_type': feature.feature_type,
-        'title': title_for_map_feature(feature),
+        'title': feature.title(),
         'address_full': feature.address_full,
         'upload_photo_endpoint': None,
         'photos': None,
         'share': None,
         'favorited': favorited,
         'photo_upload_share_text': _photo_upload_share_text(feature),
-    }
+    })
 
     _add_eco_benefits_to_context_dict(instance, feature, context)
 
@@ -370,8 +385,12 @@ def _add_share_context(context, request, photos):
             'treemap': request.instance.name
         }
 
+    url = reverse('map_feature_detail',
+                  kwargs={'instance_url_name': request.instance.url_name,
+                          'feature_id': context['feature'].pk})
+
     context['share'] = {
-        'url': request.build_absolute_uri(),
+        'url': request.build_absolute_uri(url),
         'title': title,
         'description': description,
         'image': photo_url,
@@ -380,7 +399,7 @@ def _add_share_context(context, request, photos):
 
 def set_map_feature_updated_at():
     models = [Model.map_feature_type for Model in
-              leaf_subclasses(MapFeature)]
+              leaf_models_of_class(MapFeature)]
     if not models:
         raise Exception("Could not find any map_feature subclasses")
 

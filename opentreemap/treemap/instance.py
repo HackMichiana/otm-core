@@ -4,103 +4,30 @@ from __future__ import unicode_literals
 from __future__ import division
 
 from django.contrib.gis.db import models
+from django.contrib.gis.geos import MultiPolygon, Polygon
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.core.validators import RegexValidator
 from django.conf import settings
+from django.db import transaction
 from django.db.models import F
 from django.utils.translation import ugettext_lazy as _
 
 import hashlib
 import json
 from urllib import urlencode
-import re
 
-from copy import deepcopy
-
+from treemap.search_fields import (DEFAULT_MOBILE_SEARCH_FIELDS,
+                                   DEFAULT_MOBILE_API_FIELDS,
+                                   DEFAULT_SEARCH_FIELDS, API_FIELD_ERRORS,
+                                   advanced_search_fields,
+                                   get_udfc_search_fields)
 from treemap.species import SPECIES
-from treemap.species.codes import ITREE_REGIONS
 from treemap.json_field import JSONField
 from treemap.lib.object_caches import udf_defs
 from treemap.species.codes import (species_codes_for_regions,
                                    all_species_codes, ITREE_REGION_CHOICES)
 
 URL_NAME_PATTERN = r'[a-zA-Z]+[a-zA-Z0-9\-]*'
-
-DEFAULT_MOBILE_SEARCH_FIELDS = {
-    'standard': [{'search_type': 'SPECIES',
-                  'identifier': 'species.id',
-                  'label': 'Species'},
-                 {'search_type': 'RANGE',
-                  'identifier': 'tree.diameter',
-                  'label': 'Diameter'},
-                 {'search_type': 'RANGE',
-                  'identifier': 'tree.height',
-                  'label': 'Height'}],
-    'missing': [{'identifier': 'species.id',
-                 'label': 'Missing Species'},
-                {'identifier': 'tree.diameter',
-                 'label': 'Missing Diameter'},
-                {'identifier': 'mapFeaturePhoto.id',
-                 'label': 'Missing Photo'}]
-}
-
-DEFAULT_MOBILE_API_FIELDS = [
-    {'header': _('Tree Information'),
-     'field_keys': ['tree.species', 'tree.diameter',
-                    'tree.height', 'tree.date_planted']},
-    {'header': _('Planting Site Information'),
-     'field_keys': ['plot.width', 'plot.length']},
-    {'header': _('Stewardship'),
-     'collection_udf_keys': ['plot.udf:Stewardship', 'tree.udf:Stewardship'],
-     'sort_key': 'Date'}
-]
-
-DEFAULT_TREE_STEWARDSHIP_CHOICES = [
-    'Watered',
-    'Pruned',
-    'Mulched, Had Compost Added, or Soil Amended',
-    'Cleared of Trash or Debris']
-
-DEFAULT_PLOT_STEWARDSHIP_CHOICES = [
-    'Enlarged',
-    'Changed to Include a Guard',
-    'Changed to Remove a Guard',
-    'Filled with Herbaceous Plantings']
-
-API_FIELD_ERRORS = {
-    'no_field_groups': _('Must be a non-empty list'),
-
-    'group_has_no_header': _(
-        'Every mobile field group must have a non-empty header'),
-
-    'group_has_no_keys': _(
-        'All mobile field groups must have either a "field_keys" or '
-        '"collection_udf_keys" containing a non-empty list'),
-
-    'group_has_both_keys': _(
-        'Mobile field groups cannot contain both "field_keys" and '
-        '"collection_udf_keys" properties'),
-
-    'group_has_no_sort_key': _(
-        'Collection field groups must have a non-empty "sort_key" property '
-        'defined'),
-
-    'group_has_missing_cudf': _(
-        'Collection field groups can only contain existing custom collection '
-        'fields'),
-
-    'group_has_invalid_sort_key': _(
-        'The "sort_key" property of a collection field group must be the name '
-        'of a field on present on every collection field in the group'),
-
-    'duplicate_fields': _('Fields cannot be specified more than once'),
-
-    'invalid_field': _('The specified field "%(field)s" is invalid'),
-
-    'missing_field': _(
-        'Normal field groups may only contain existing fields. If you specify '
-        'a custom field, it cannot be a collection field'),
-}
 
 
 def reserved_name_validator(name):
@@ -110,32 +37,35 @@ def reserved_name_validator(name):
                                 'cannot be used') % {'instancename': name})
 
 
+def get_or_create_udf(instance, model, udfc_name):
+    from treemap.udf import UserDefinedFieldDefinition
+    from treemap.util import safe_get_model_class
+
+    clz = safe_get_model_class(model)
+    udfc_settings = clz.udf_settings[udfc_name]
+    kwargs = {
+        'instance_id': instance.pk,
+        'model_type': model,
+        'iscollection': udfc_settings.get('iscollection'),
+        'name': udfc_name,
+    }
+    try:
+        udfc = UserDefinedFieldDefinition.objects.get(**kwargs)
+    except UserDefinedFieldDefinition.DoesNotExist:
+        kwargs['datatype'] = json.dumps(udfc_settings.get('defaults'))
+        udfc = UserDefinedFieldDefinition.objects.create(**kwargs)
+    return udfc
+
+
 def create_stewardship_udfs(instance):
-    from treemap.udf import UserDefinedFieldDefinition  # Circular import
-
-    def create_udf(model, choices):
-        return UserDefinedFieldDefinition.objects.create(
-            instance_id=instance.pk,
-            model_type=model,
-            datatype=json.dumps([
-                {'type': 'choice',
-                 'choices': choices,
-                 'name': 'Action'},
-                {'type': 'date',
-                 'name': 'Date'}]),
-            iscollection=True,
-            name='Stewardship')
-
-    opts = (('Plot', DEFAULT_PLOT_STEWARDSHIP_CHOICES),
-            ('Tree', DEFAULT_TREE_STEWARDSHIP_CHOICES))
-
-    return [create_udf(model, choices) for model, choices in opts]
+    return [get_or_create_udf(instance, model, 'Stewardship')
+            for model in ('Plot', 'Tree')]
 
 
 def add_species_to_instance(instance):
     from treemap.models import Species
 
-    region_codes = instance.itree_region_codes()
+    region_codes = [itr.code for itr in instance.itree_regions()]
     if region_codes:
         # Add species from all of the instance's i-Tree regions
         species_codes = species_codes_for_regions(region_codes)
@@ -158,6 +88,34 @@ def add_species_to_instance(instance):
             species_dict['instance'] = instance
             instance_species_list.append(Species(**species_dict))
     Species.objects.bulk_create(instance_species_list)
+
+
+class InstanceBounds(models.Model):
+    """ Center of the map when loading the instance """
+    geom = models.MultiPolygonField(srid=3857)
+    objects = models.GeoManager()
+
+    @classmethod
+    def create_from_point(cls, x, y, half_edge=50000):
+        """Create as square using Web Mercator point and default edge 100km"""
+        return cls.create_from_box(
+            x - half_edge, y - half_edge,
+            x + half_edge, y + half_edge
+        )
+
+    @classmethod
+    def create_from_box(cls, x_min, y_min, x_max, y_max):
+        """Create from box (Web Mercator coordinates)"""
+        bounds = Polygon(((x_min, y_min),
+                          (x_min, y_max),
+                          (x_max, y_max),
+                          (x_max, y_min),
+                          (x_min, y_min)))
+        bounds = MultiPolygon((bounds, ))
+        return InstanceBounds.objects.create(geom=bounds)
+
+    def __str__(self):
+        return "instance_id: %s" % self.instance.id
 
 
 class Instance(models.Model):
@@ -187,33 +145,43 @@ class Instance(models.Model):
     basemap_type = models.CharField(max_length=255,
                                     choices=(("google", "Google"),
                                              ("bing", "Bing"),
+                                             ("esri", "ESRI"),
                                              ("tms", "Tile Map Service")),
                                     default="google")
     basemap_data = models.CharField(max_length=255, null=True, blank=True)
 
     """
-    The current database revision for the instance
+    Revision fields are monotonically increasing counters, each
+    incremented under differing conditions, all used to invalidate one
+    of multiple caching layers, so that repeated requests for the same
+    data may benefit from caching. Their respective values are part of
+    all tile URLs and ecobenefit summaries.
 
-    This revision is used to determine if tiles should be cached.
-    In particular, the revision has *no* effect on the actual
-    data.
+    The "universal revision" is incremented whenever instance values that
+    affect aggregates are changed *in any way*. When using a search filter,
+    any field of MapFeature and Tree is a trigger for cache invalidation.
+    Its value is part of all search tile URLs and search ecobenefit summary
+    cache keys.
 
-    Generally we make tile requests like:
-    http://tileserver/tile/{layer}/{rev}/{Z}/{Y}/{X}
+    The "geometry revision" is incremented whenever a map feature is
+    modified in a way that would affect rendered tiles for non-search
+    map rendering. Its value is part of all non-search tile URLs.
 
-    There is a database trigger that updates the
-    revision whenever an edit to a geometry field is made
-    so you don't have to worry about it.
-
-    You should *not* edit this field.
+    The "ecobenefit revision" is incremented whenever a tree is
+    modified in a way that would affect ecobenefit calculations.
+    Its value is part of cache keys for non-search ecobenefit summaries.
     """
     geo_rev = models.IntegerField(default=1)
+    universal_rev = models.IntegerField(default=1, null=True, blank=True)
+    eco_rev = models.IntegerField(default=1)
 
     eco_benefits_conversion = models.ForeignKey(
         'BenefitCurrencyConversion', null=True, blank=True)
 
     """ Center of the map when loading the instance """
-    bounds = models.MultiPolygonField(srid=3857)
+    bounds = models.OneToOneField(InstanceBounds,
+                                  on_delete=models.CASCADE,
+                                  null=True, blank=True)
 
     """
     Override the center location (which is, by default,
@@ -223,16 +191,15 @@ class Instance(models.Model):
 
     default_role = models.ForeignKey('Role', related_name='default_role')
 
-    users = models.ManyToManyField('User', through='InstanceUser',
-                                   null=True, blank=True)
+    users = models.ManyToManyField('User', through='InstanceUser')
 
-    boundaries = models.ManyToManyField('Boundary', null=True, blank=True)
+    boundaries = models.ManyToManyField('Boundary')
 
     """
-    Config contains a bunch of config variables for a given instance
-    these can be accessed via per-config properties such as
-    `advanced_search_fields`. Note that it is a DotDict, and so supports
-    get() with a dotted key and a default, e.g.
+    Config contains a bunch of configuration variables for a given instance,
+    which can be accessed via properties such as `map_feature_types`.
+    Note that it is a DotDict, and so supports get() with a dotted key and a
+    default, e.g.
         instance.config.get('fruit.apple.type', 'delicious')
     as well as creating dotted keys when no keys in the path exist yet, e.g.
         instance.config = DotDict({})
@@ -280,100 +247,42 @@ class Instance(models.Model):
     mobile_api_fields = _make_config_property('mobile_api_fields',
                                               DEFAULT_MOBILE_API_FIELDS)
 
+    search_config = _make_config_property('search_config',
+                                          DEFAULT_SEARCH_FIELDS)
+
     non_admins_can_export = models.BooleanField(default=True)
 
-    @property
-    def advanced_search_fields(self):
-        # TODO pull from the config once users have a way to set search fields
+    def advanced_search_fields(self, user):
+        return advanced_search_fields(self, user)
 
-        if not self.feature_enabled('advanced_search_filters'):
-            return {'standard': [], 'missing': [], 'display': [],
-                    'udfc': self._get_udfc_search_fields()}
+    def get_udfc_search_fields(self, user):
+        return get_udfc_search_fields(self, user)
 
-        from treemap.models import MapFeature  # prevent circular import
+    def editable_udf_models(self):
+        from treemap.plugin import feature_enabled
+        from treemap.models import Tree, Plot
+        from treemap.udf import UDFModel
+        from treemap.util import leaf_models_of_class
+        gsi_enabled = feature_enabled(self, 'green_infrastructure')
 
-        fields = {
-            'standard': [
-                {'identifier': 'tree.diameter', 'search_type': 'RANGE'},
-                {'identifier': 'tree.date_planted', 'search_type': 'RANGE'},
-                {'identifier': 'mapFeature.updated_at', 'search_type': 'RANGE'}
-            ],
-            'display': [
-                {'model': 'Tree', 'label': 'Show trees'},
-                {'model': 'EmptyPlot',
-                 'label': 'Show empty planting sites'}
-            ],
-            'missing': [
-                {'identifier': 'species.id',
-                 'label': 'Show missing species',
-                 'search_type': 'ISNULL',
-                 'value': 'true'},
-                {'identifier': 'tree.diameter',
-                 'label': 'Show missing trunk diameter',
-                 'search_type': 'ISNULL',
-                 'value': 'true'},
-                {'identifier': 'mapFeaturePhoto.id',
-                 'label': 'Show missing photos',
-                 'search_type': 'ISNULL',
-                 'value': 'true'}
-            ],
-        }
+        core_models = {Tree, Plot}
+        gsi_models = {clz for clz in leaf_models_of_class(UDFModel)
+                      if gsi_enabled
+                      and clz.__name__ in self.map_feature_types
+                      and getattr(clz, 'is_editable', False)
+                      and clz not in core_models}
+        all_models = core_models | gsi_models
 
-        def make_display_filter(feature_name):
-            Feature = MapFeature.get_subclass(feature_name)
-            if hasattr(Feature, 'display_name_plural'):
-                plural = Feature.display_name_plural
-            else:
-                plural = Feature.display_name + 's'
-            return {
-                'label': 'Show %s' % plural.lower(),
-                'model': feature_name
-            }
-
-        fields['display'] += [make_display_filter(feature_name)
-                              for feature_name in self.map_feature_types
-                              if feature_name != 'Plot']
-
-        # It makes styling easier if every field has an identifier
-        num = 0
-        for filters in fields.itervalues():
-            for field in filters:
-                field['id'] = "%s_%s" % (field.get('identifier', ''), num)
-                num += 1
-
-        fields['udfc'] = self._get_udfc_search_fields()
-
-        return fields
-
-    def _get_udfc_search_fields(self):
-        from treemap.udf import UDFC_MODELS, UDFC_NAMES
-        from treemap.util import to_object_name
-
-        empty_udfc = {to_object_name(n_k):
-                      {to_object_name(m_k): {'fields': [], 'udfd': None}
-                       for m_k in UDFC_MODELS}
-                      for n_k in UDFC_NAMES}
-
-        udfds = []
-        for model_name in UDFC_MODELS:
-            for udfd in udf_defs(self, model_name):
-                if udfd.name in UDFC_NAMES:
-                    udfds.append(udfd)
-
-        udfc = deepcopy(empty_udfc)
-
-        for udfd in udfds:
-            udfd_info = {
-                'udfd': udfd,
-                'fields': udfd.datatype_dict[0]['choices']
-            }
-            name_dict = udfc[to_object_name(udfd.name)]
-            name_dict[to_object_name(udfd.model_type)] = udfd_info
-
-        return udfc
+        return {'core': core_models, 'gsi': gsi_models, 'all': all_models}
 
     @property
-    def supports_resources(self):
+    def collection_udfs(self):
+        from treemap.udf import UserDefinedFieldDefinition
+        return UserDefinedFieldDefinition.objects.filter(
+            instance=self, iscollection=True)
+
+    @property
+    def has_resources(self):
         """
         Determine whether this instance has multiple map feature
         types (plots + "resources") or not.
@@ -383,7 +292,7 @@ class Instance(models.Model):
 
     @property
     def extent_as_json(self):
-        boundary = self.bounds.boundary
+        boundary = self.bounds.geom.boundary
         xmin, ymin, xmax, ymax = boundary.extent
 
         return json.dumps({'xmin': xmin, 'ymin': ymin,
@@ -391,17 +300,21 @@ class Instance(models.Model):
 
     @property
     def bounds_as_geojson(self):
-        boundary = self.bounds
+        boundary = self.bounds.geom
         boundary.transform(4326)
         return boundary.json
 
     @property
     def center(self):
-        return self.center_override or self.bounds.centroid
+        return self.center_override or self.bounds.geom.centroid
 
     @property
     def geo_rev_hash(self):
         return hashlib.md5(str(self.geo_rev)).hexdigest()
+
+    @property
+    def universal_rev_hash(self):
+        return hashlib.md5(str(self.universal_rev)).hexdigest()
 
     @property
     def center_lat_lng(self):
@@ -439,39 +352,124 @@ class Instance(models.Model):
 
         return names
 
-    def update_geo_rev(self):
-        qs = Instance.objects.filter(pk=self.id)
+    @property
+    def species_thumbprint(self):
+        # Species autocomplete data lives in browser local storage.
+        # It must be invalidated when a different instance is loaded,
+        # or when the current instance's species are updated.
+        #
+        # To get a unique thumbprint across instances and species updates
+        # we use the instance's latest species update time if available,
+        # and otherwise its url name.
+        from treemap.models import Species
+        thumbprint = None
+        my_species = Species.objects \
+            .filter(instance_id=self.id) \
+            .order_by('-updated_at')
+        try:
+            thumbprint = my_species[0].updated_at
+        except IndexError:
+            pass
+        return "%s_%s" % (self.url_name, thumbprint)
 
-        # Use SQL increment in case self.geo_rev is stale
-        qs.update(geo_rev=F('geo_rev') + 1)
+    @property
+    def boundary_thumbprint(self):
+        # Boundary autocomplete data lives in browser local storage.
+        # It must be invalidated when a different instance is loaded,
+        # or when the current instance's species are updated.
+        #
+        # To get a unique thumbprint across instances and boundary updates
+        # we use the latest boundary update time if available,
+        # and otherwise the instance's url name.
+        from treemap.models import Boundary
+        thumbprint = None
+        my_boundaries = Boundary.objects.order_by('-updated_at')
+        try:
+            thumbprint = my_boundaries[0].updated_at
+        except IndexError:
+            pass
+        return "%s_%s" % (self.url_name, thumbprint)
+
+    @transaction.atomic
+    def remove_map_feature_types(self, remove=None, keep=None):
+        from treemap.util import to_object_name
+        if keep and remove:
+            raise Exception('Invalid use of remove_map_features API: '
+                            'pass arguments "keep" or "remove" but not both')
+        elif keep:
+            remaining_types = [name for name in self.map_feature_types
+                               if name in keep]
+        else:
+            remaining_types = [class_name for class_name
+                               in self.map_feature_types
+                               if class_name not in remove]
+
+        for class_name in self.map_feature_types:
+            if class_name not in remaining_types:
+                if class_name in self.search_config:
+                    del self.search_config[class_name]
+                if 'missing' in self.search_config:
+                    self.search_config['missing'] = [
+                        o for o in self.search_config['missing']
+                        if not o.get('identifier', '').startswith(
+                            to_object_name(class_name))]
+                # TODO: delete from mobile_api_fields
+                # non-plot mobile_api_fields are not currently
+                # supported, but when they are added, they should
+                # also be removed here.
+        self.map_feature_types = remaining_types
+        self.save()
+
+    @transaction.atomic
+    def add_map_feature_types(self, types):
+        from treemap.models import MapFeature  # prevent circular import
+        from treemap.audit import add_default_permissions
+
+        classes = [MapFeature.get_subclass(type) for type in types]
+
+        dups = set(types) & set(self.map_feature_types)
+        if len(dups) > 0:
+            raise ValidationError('Map feature types already added: %s' % dups)
+
+        self.map_feature_types = list(self.map_feature_types) + list(types)
+        self.save()
+
+        for type, clz in zip(types, classes):
+            settings = (getattr(clz, 'udf_settings', {}))
+            for udfc_name, udfc_settings in settings.items():
+                if udfc_settings.get('defaults'):
+                    get_or_create_udf(self, type, udfc_name)
+
+        add_default_permissions(self, models=classes)
+
+    def update_geo_rev(self):
+        self.update_revs('geo_rev')
+
+    def update_eco_rev(self):
+        self.update_revs('eco_rev')
+
+    def update_universal_rev(self):
+        self.update_revs('universal_rev')
+
+    def update_revs(self, *attrs):
+        # Use SQL increment in case a value in attrs is stale
+        qs = Instance.objects.filter(pk=self.id)
+        qs.update(**{attr: F(attr) + 1 for attr in attrs})
 
         # Fetch updated value so callers will have it
-        self.geo_rev = qs[0].geo_rev
+        for attr in attrs:
+            setattr(self, attr, getattr(qs[0], attr))
 
-    def itree_region_codes(self):
-        from treemap.models import ITreeRegion
+    def itree_regions(self, **extra_query):
+        from treemap.models import ITreeRegion, ITreeRegionInMemory
+
+        query = {'geometry__intersects': self.bounds.geom}
+        query.update(extra_query)
 
         if self.itree_region_default:
-            region_codes = [self.itree_region_default]
+            return [ITreeRegionInMemory(self.itree_region_default)]
         else:
-            region_codes = ITreeRegion.objects \
-                .filter(geometry__intersects=self.bounds) \
-                .values_list('code', flat=True)
-
-        return region_codes
-
-    def itree_regions(self):
-        from treemap.models import ITreeRegion  # prevent circular import
-        if self.itree_region_default:
-            codes = [self.itree_region_default]
-        else:
-            codes = (ITreeRegion
-                     .objects
-                     .filter(geometry__intersects=self.bounds)
-                     .values_list('code', flat=True))
-
-        return [(code, ITREE_REGIONS.get(code, {}).get('name'))
-                for code in codes]
+            return ITreeRegion.objects.filter(**query)
 
     def has_itree_region(self):
         return bool(self.itree_regions())
@@ -492,6 +490,12 @@ class Instance(models.Model):
             return True
         except ObjectDoesNotExist:
             return False
+
+    def plot_count(self):
+        from treemap.ecocache import get_cached_plot_count
+        from treemap.search import Filter
+        all_plots_filter = Filter('', '', self)
+        return get_cached_plot_count(all_plots_filter)
 
     def scope_model(self, model):
         qs = model.objects.filter(instance=self)
@@ -558,14 +562,14 @@ class Instance(models.Model):
             if not _truthy_of_type(group.get('header'), basestring):
                 errors.add(API_FIELD_ERRORS['group_has_no_header'])
 
-            if ((not _truthy_of_type(group.get('collection_udf_keys'), list)
-                 and not _truthy_of_type(group.get('field_keys'), list))):
+            if ((not isinstance(group.get('collection_udf_keys'), list)
+                 and not isinstance(group.get('field_keys'), list))):
                 errors.add(API_FIELD_ERRORS['group_has_no_keys'])
 
             elif 'collection_udf_keys' in group and 'field_keys' in group:
                 errors.add(API_FIELD_ERRORS['group_has_both_keys'])
 
-            if 'collection_udf_keys' in group:
+            if isinstance(group.get('collection_udf_keys'), list):
                 sort_key = group.get('sort_key')
                 if not sort_key:
                     errors.add(API_FIELD_ERRORS['group_has_no_sort_key'])
@@ -577,6 +581,16 @@ class Instance(models.Model):
                     elif sort_key not in udef.datatype_by_field:
                         errors.add(
                             API_FIELD_ERRORS['group_has_invalid_sort_key'])
+            elif isinstance(group.get('field_keys'), list):
+                if group.get('model') not in {'tree', 'plot'}:
+                    errors.add(API_FIELD_ERRORS['group_missing_model'])
+                else:
+                    for key in group['field_keys']:
+                        if not key.startswith(group['model']):
+                            errors.add(API_FIELD_ERRORS['group_invalid_model'])
+
+        if errors:
+            raise ValidationError({'mobile_api_fields': list(errors)})
 
         scalar_fields = [key for group in field_groups
                          for key in group.get('field_keys', [])]
@@ -589,11 +603,6 @@ class Instance(models.Model):
             errors.add(API_FIELD_ERRORS['duplicate_fields'])
 
         for field in scalar_fields:
-            if not re.match(r'(?:plot|tree)[.].*', field):
-                errors.add(
-                    API_FIELD_ERRORS['invalid_field'] % {'field': field})
-                continue
-
             model_name, name = field.split('.', 1)  # maxsplit of 1
             Model = Plot if model_name == 'plot' else Tree
             standard_fields = Model._meta.get_all_field_names()
@@ -602,7 +611,7 @@ class Instance(models.Model):
                 errors.add(API_FIELD_ERRORS['missing_field'])
 
         if errors:
-            raise ValidationError({'mobile_api_fields': errors})
+            raise ValidationError({'mobile_api_fields': list(errors)})
 
     def save(self, *args, **kwargs):
         self.full_clean()

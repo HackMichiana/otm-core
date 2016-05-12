@@ -32,6 +32,10 @@ var displayListIsEmpty = exports.displayListIsEmpty = function(displayList) {
     return _.isUndefined(displayList) || _.isNull(displayList);
 };
 
+var isEmpty = exports.isEmpty = function(obj) {
+    return filterObjectIsEmpty(obj.filter) && displayListIsEmpty(obj.display);
+};
+
 var makeQueryStringFromFilters = exports.makeQueryStringFromFilters = function(config, filters) {
     var query = {};
     if ( ! filterObjectIsEmpty(filters.filter)) {
@@ -107,9 +111,9 @@ function applyFilterObjectToDom(search) {
             $domElem.trigger('restore', value);
         } else if ($domElem.is('[data-date-format]')) {
             FH.applyDateToDatepicker($domElem, value);
-        } else if($domElem.is(':checkbox')) {
+        } else if ($domElem.is(':checkbox')) {
             $domElem.prop('checked', boolToText(value) === $domElem.val());
-        } else if ($domElem.is('input')) {
+        } else if ($domElem.is('input,select')) {
             $domElem.val(value || '');
         }
     });
@@ -165,15 +169,21 @@ function buildFilterObject () {
                     date = date.endOf("day");
                 }
                 val = date.format(DATETIME_FORMAT);
-            }
-
-            if ($elem.is(":checkbox")) {
+            } else if ($elem.is(":checkbox")) {
                 if ($elem.is(":checked")) {
-                    pred[key_and_pred.pred] = textToBool(val);
+                    val = textToBool(val);
                 }
+            } else if (_.contains(['MIN', 'MAX'], key_and_pred.pred)) {
+                // range searches (min and max) are the only type in which
+                // comparison as text will yield undesirable results for
+                // numbers. Casting to float is satisfactory because it
+                // will make numeric comparison more flexible, and range
+                // searches on text don't make sense.
+                val = parseFloat(val);
             } else {
-                pred[key_and_pred.pred] = val;
+                val = val;
             }
+            pred[key_and_pred.pred] = val;
 
             // We do a deep extend so that if a predicate field
             // (such as tree.diameter) is already specified,

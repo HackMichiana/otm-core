@@ -15,12 +15,15 @@
 
 var $ = require('jquery'),
     _ = require('lodash'),
+    format = require('util').format,
 
     enablePermAttr = 'data-always-enable',
     disabledTitleAttr = 'data-disabled-title',
     redirectUrlAttr = 'data-redirect-url',
     hrefAttr = 'data-href',
     enablePermSelector = '[' + enablePermAttr + ']',
+    disabledButtonWrapperAttrPair = 'data-class="disabled-button-wrapper"',
+    disabledButtonWrapperSelector = '[' + disabledButtonWrapperAttrPair + ']',
     config;
 
 function removeActionableDataAttributes($el) {
@@ -30,9 +33,9 @@ function removeActionableDataAttributes($el) {
     $el.removeAttr('data-action');
 }
 
-function makeRedirectToLogin($el, href) {
+function makeRedirectToLogin(loginUrl, $el, href) {
 
-    var fullHref = config.loginUrl + href;
+    var fullHref = loginUrl + href;
 
     $el.attr('disabled', false);
     removeActionableDataAttributes($el);
@@ -52,15 +55,20 @@ function fullyEnable($el, href) {
 }
 
 function fullyDisable($el, disabledTitle) {
+    var wrapperTemplate =
+            '<label ' + disabledButtonWrapperAttrPair +
+            ' title="%s"></label>';
+
     $el.off('click');
     removeActionableDataAttributes($el);
-    if (disabledTitle) { $el.attr('title', disabledTitle); }
+    if (disabledTitle && !$el.parent().is(disabledButtonWrapperSelector)) {
+        $el.wrap(format(wrapperTemplate, disabledTitle));
+    }
 }
 
 exports.run = function (options) {
-    var $elements = $(enablePermSelector);
-
-    config = options.config;
+    var $elements = $(enablePermSelector),
+        config = options.config;
 
     _.each($elements, function(element) {
         var $element = $(element),
@@ -71,7 +79,7 @@ exports.run = function (options) {
         if (hasPerm === 'True') {
             fullyEnable($element, href);
         } else if (!config.loggedIn) {
-            makeRedirectToLogin($element, href);
+            makeRedirectToLogin(config.loginUrl, $element, href);
         } else {
             fullyDisable($element, disabledTitle);
         }

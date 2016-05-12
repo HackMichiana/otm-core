@@ -3,8 +3,6 @@ from __future__ import print_function
 from __future__ import unicode_literals
 from __future__ import division
 
-from copy import deepcopy
-
 from django.conf import settings
 from django.db.models import F
 
@@ -67,8 +65,11 @@ def increment_adjuncts_timestamp(instance):
     # Don't call save(), to avoid storing possibly-stale data in "instance".
     # Use a SQL increment, to prevent race conditions between servers.
     from treemap.models import Instance
-    Instance.objects.filter(pk=instance.id)\
-                    .update(adjuncts_timestamp=F('adjuncts_timestamp') + 1)
+    qs = Instance.objects.filter(pk=instance.id)
+    qs.update(adjuncts_timestamp=F('adjuncts_timestamp') + 1)
+
+    # Update timestamp from DB to prevent saving stale timestamps
+    instance.adjuncts_timestamp = qs[0].adjuncts_timestamp
 
 
 # ------------------------------------------------------------------------
@@ -130,20 +131,12 @@ class _InstanceAdjuncts:
     def role_permissions(self, role_id, model_name):
         if not self._permissions:
             self._load_permissions()
-        perms = self._permissions.get((role_id, model_name))
-
-        # We must always deepcopy the cached items before returning them,
-        # to prevent inadvertent modifcations to the cached items
-        return deepcopy(perms) if perms else []
+        return self._permissions.get((role_id, model_name), [])
 
     def udf_defs(self, model_name):
         if not self._udf_defs:
             self._load_udf_defs()
-        defs = self._udf_defs.get(model_name)
-
-        # We must always deepcopy the cached items before returning them,
-        # to prevent inadvertent modifcations to the cached items
-        return deepcopy(defs) if defs else []
+        return self._udf_defs.get(model_name, [])
 
     def _load_roles(self):
         from treemap.models import InstanceUser

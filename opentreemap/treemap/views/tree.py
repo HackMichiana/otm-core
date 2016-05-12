@@ -13,10 +13,11 @@ from django.db import transaction
 from django.http import HttpResponseRedirect
 
 from treemap.search import Filter
-from treemap.models import Plot, Tree
+from treemap.models import Tree
 from treemap.audit import Audit
 from treemap.ecobenefits import get_benefits_for_filter
 from treemap.ecobenefits import BenefitCategory
+from treemap.ecocache import get_cached_plot_count
 from treemap.lib import format_benefits
 from treemap.lib.tree import add_tree_photo_helper
 from treemap.lib.photo import context_dict_for_photo
@@ -63,7 +64,7 @@ def search_tree_benefits(request, instance):
     hide_summary = hide_summary_text.lower() == 'true'
 
     filter = Filter(filter_str, display_str, instance)
-    total_plots = filter.get_object_count(Plot)
+    total_plots = get_cached_plot_count(filter)
 
     benefits, basis = get_benefits_for_filter(filter)
 
@@ -88,14 +89,14 @@ def search_tree_benefits(request, instance):
         'label': _('Total annual benefits')
     }
 
-    formatted = format_benefits(instance, benefits, basis)
+    formatted = format_benefits(instance, benefits, basis, digits=0)
     formatted['hide_summary'] = hide_summary
 
     formatted['tree_count_label'] = (
         'tree,' if basis['plot']['n_total'] == 1 else 'trees,')
     formatted['plot_count_label'] = (
         'planting site' if basis['plot']['n_plots'] == 1 else 'planting sites')
-    if instance.supports_resources and 'resource' in benefits:
+    if instance.has_resources and 'resource' in basis:
         formatted['plot_count_label'] += ','
 
     return formatted
@@ -117,6 +118,8 @@ def search_hash(request, instance):
     else:
         eco_str = 'none'
 
-    string_to_hash = audit_id_str + ":" + eco_str
+    map_features = ','.join(instance.map_feature_types)
+
+    string_to_hash = audit_id_str + ":" + eco_str + ":" + map_features
 
     return hashlib.md5(string_to_hash).hexdigest()

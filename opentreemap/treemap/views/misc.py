@@ -6,13 +6,17 @@ from __future__ import division
 import string
 import re
 import sass
+import json
 
 from django.utils.translation import ugettext as _
 from django.core.urlresolvers import reverse
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.http import HttpResponse, HttpResponseRedirect
-from django.shortcuts import get_object_or_404
+from django.shortcuts import get_object_or_404, render_to_response
+from django.template import RequestContext
+
+from stormwater.models import PolygonalMapFeature
 
 from treemap.models import User, Species, StaticPage, MapFeature, Instance
 
@@ -20,6 +24,8 @@ from treemap.plugin import get_viewable_instances_filter
 
 from treemap.lib.user import get_audits, get_audits_params
 from treemap.lib import COLOR_RE
+from treemap.lib.perms import map_feature_is_creatable
+from treemap.util import leaf_models_of_class
 
 
 _SCSS_VAR_NAME_RE = re.compile('^[_a-zA-Z][-_a-zA-Z0-9]*$')
@@ -65,14 +71,33 @@ def index(request, instance):
 
 
 def get_map_view_context(request, instance):
-    resource_classes = [MapFeature.get_subclass(type)
-                        for type in instance.map_feature_types]
-    return {
+    if request.user and not request.user.is_anonymous():
+        iuser = request.user.get_instance_user(instance)
+        resource_names = [mfn for mfn in instance.map_feature_types
+                          if mfn != 'Plot']
+        resource_classes = [resource for resource in
+                            map(MapFeature.get_subclass, resource_names)
+                            if map_feature_is_creatable(iuser, resource)]
+    else:
+        resource_classes = []
+
+    context = {
         'fields_for_add_tree': [
             (_('Tree Height'), 'Tree.height')
         ],
-        'resource_classes': resource_classes[1:]
+        'resource_classes': resource_classes,
+        'only_one_resource_class': len(resource_classes) == 1,
     }
+    add_map_info_to_context(context, instance)
+    return context
+
+
+def add_map_info_to_context(context, instance):
+    all_polygon_types = {c.map_feature_type
+                         for c in leaf_models_of_class(PolygonalMapFeature)}
+    my_polygon_types = set(instance.map_feature_types) & all_polygon_types
+    context['has_polygons'] = len(my_polygon_types) > 0
+    context['has_boundaries'] = instance.boundaries.exists()
 
 
 def static_page(request, instance, page):
@@ -214,3 +239,29 @@ def public_instances_geojson(request):
                  }))
 
     return [instance_geojson(instance) for instance in instances]
+
+
+def error_page(status_code):
+    template = '%s.html' % status_code
+
+    def inner_fn(request):
+        reasons = {
+            404: _('URL or resource not found'),
+            500: _('An unhandled error occured'),
+            503: _('Resource is temporarily unavailable')
+        }
+
+        # API requests with an unhandled error should return JSON, not HTML
+        if ((request.path.startswith('/api/') or
+             'application/json' in request.META.get('HTTP_ACCEPT', ''))):
+            response = HttpResponse(json.dumps(
+                {'status': 'Failure', 'reason': reasons[status_code]}),
+                content_type='application/json')
+        else:
+            response = render_to_response(
+                template, context_instance=RequestContext(request))
+
+        response.status_code = status_code
+        return response
+
+    return inner_fn

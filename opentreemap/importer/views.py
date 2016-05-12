@@ -5,30 +5,39 @@ from __future__ import division
 
 import json
 import io
+import csv
+
 from copy import copy
-from celery.result import GroupResult
+from celery.result import GroupResult, AsyncResult
 
 from django.db import transaction
+from django.db.models import Q
 from django.shortcuts import get_object_or_404, render_to_response
 from django.template import RequestContext
-from django.core.paginator import Paginator, Page
+from django.core.paginator import Paginator, Page, EmptyPage
 from django.core.urlresolvers import reverse
-from django.http import HttpResponse
+from django.http import HttpResponse, HttpResponseBadRequest
 from django.utils.translation import ugettext as _
 
 from treemap.models import Species, Tree, User, MapFeature
-from treemap.units import (get_conversion_factor, get_value_display_attr)
+from treemap.units import (storage_to_instance_units_factor,
+                           get_value_display_attr)
 from treemap.plugin import get_tree_limit
 
-from exporter.decorators import task_output_as_csv
+from exporter.decorators import task_output_as_csv, queryset_as_exported_csv
 
 from importer.models.base import GenericImportEvent, GenericImportRow
 from importer.models.trees import TreeImportEvent, TreeImportRow
 from importer.models.species import SpeciesImportEvent, SpeciesImportRow
 from importer.tasks import (run_import_event_validation, commit_import_event,
                             get_import_event_model, get_import_row_model,
-                            get_all_species_export, get_import_export)
+                            get_import_export)
 from importer import errors, fields
+
+TABLE_ACTIVE_TREES = 'activeTrees'
+TABLE_FINISHED_TREES = 'finishedTrees'
+TABLE_ACTIVE_SPECIES = 'activeSpecies'
+TABLE_FINISHED_SPECIES = 'finishedSpecies'
 
 
 def _find_similar_species(target, instance):
@@ -51,58 +60,141 @@ def _find_similar_species(target, instance):
 
 
 def start_import(request, instance):
+    if not getattr(request, 'FILES'):
+        return HttpResponseBadRequest("No attachment received")
+
     import_type = request.REQUEST['type']
     if import_type == TreeImportEvent.import_type:
-        factors = {'plot_length_conversion_factor': 'unit_plot_length',
-                   'plot_width_conversion_factor': 'unit_plot_width',
-                   'diameter_conversion_factor': 'unit_diameter',
-                   'tree_height_conversion_factor': 'unit_tree_height',
-                   'canopy_height_conversion_factor': 'unit_canopy_height'}
-        kwargs = {k: float(request.REQUEST.get(v, 1.0))
-                  for (k, v) in factors.items()}
-    else:
-        kwargs = {
-            'max_diameter_conversion_factor':
-            get_conversion_factor(instance, 'tree', 'diameter'),
-            'max_tree_height_conversion_factor':
-            get_conversion_factor(instance, 'tree', 'height')
+        table = TABLE_ACTIVE_TREES
+        factors = {
+            'diameter_conversion_factor': ('tree', 'diameter'),
+            'tree_height_conversion_factor': ('tree', 'height'),
+            'canopy_height_conversion_factor': ('tree', 'canopy_height'),
+            'plot_length_conversion_factor': ('plot', 'length'),
+            'plot_width_conversion_factor': ('plot', 'width'),
         }
+    else:
+        table = TABLE_ACTIVE_SPECIES
+        factors = {
+            'max_diameter_conversion_factor': ('tree', 'diameter'),
+            'max_tree_height_conversion_factor': ('tree', 'height'),
+        }
+
+    kwargs = {k: 1 / storage_to_instance_units_factor(instance, v[0], v[1])
+              for (k, v) in factors.items()}
+
     process_csv(request, instance, import_type, **kwargs)
 
-    return list_imports(request, instance)
+    return get_import_table(request, instance, table)
 
 
 def list_imports(request, instance):
-    finished = GenericImportEvent.FINISHED_CREATING
+    table_names = [TABLE_ACTIVE_TREES, TABLE_FINISHED_TREES,
+                   TABLE_ACTIVE_SPECIES, TABLE_FINISHED_SPECIES]
 
-    trees = TreeImportEvent.objects.filter(instance=instance).order_by('id')
-    active_trees = trees.exclude(status=finished)
-    finished_trees = trees.filter(status=finished)
-
-    species = SpeciesImportEvent.objects\
-        .filter(instance=instance)\
-        .order_by('id')
-    active_species = species.exclude(status=finished)
-    finished_species = species.filter(status=finished)
-
-    active_events = list(active_trees) + list(active_species)
-    imports_finished = all(ie.is_finished() for ie in active_events)
+    _cleanup_tables(instance)
+    tables = [_get_table_context(instance, table_name, 1)
+              for table_name in table_names]
 
     instance_units = {k + '_' + v:
-                      get_value_display_attr(instance, k, v, 'units')[1]
+                          get_value_display_attr(instance, k, v, 'units')[1]
                       for k, v in [('plot', 'width'),
                                    ('plot', 'length'),
                                    ('tree', 'height'),
                                    ('tree', 'diameter'),
                                    ('tree', 'canopy_height')]}
+    return {
+        'tables': tables,
+        'importer_instance_units': instance_units,
+    }
 
-    return {'importer_instance_units': instance_units,
-            'active_trees': active_trees,
-            'finished_trees': finished_trees,
-            'active_species': active_species,
-            'finished_species': finished_species,
-            'imports_finished': imports_finished
-            }
+
+def get_import_table(request, instance, table_name):
+    page_number = int(request.GET.get('page', '1'))
+    _cleanup_tables(instance)
+    return {
+        'table': _get_table_context(instance, table_name, page_number)
+    }
+
+
+_EVENT_TABLE_PAGE_SIZE = 5
+
+
+def _cleanup_tables(instance):
+    q = Q(instance=instance, is_lost=False)
+    ievents = (list(TreeImportEvent.objects.filter(q)) +
+               list(SpeciesImportEvent.objects.filter(q)))
+
+    for ie in ievents:
+        mark_lost = False
+        if ie.has_not_been_processed_recently():
+            mark_lost = True
+        elif ie.task_id != '' and ie.is_running():
+            result = AsyncResult(ie.task_id)
+            if not result or result.failed():
+                mark_lost = True
+
+        if mark_lost:
+            ie.is_lost = True
+            ie.mark_finished_and_save()
+
+
+def _get_table_context(instance, table_name, page_number):
+    trees = TreeImportEvent.objects \
+        .filter(instance=instance) \
+        .order_by('-created')
+    species = SpeciesImportEvent.objects \
+        .filter(instance=instance) \
+        .order_by('-created')
+    inactive_q = Q(is_lost=True) | Q(
+        status__in={
+            GenericImportEvent.FINISHED_CREATING,
+            GenericImportEvent.FAILED_FILE_VERIFICATION})
+    trees_inactive_q = inactive_q | ~Q(
+        schema_version=TreeImportEvent.import_schema_version)
+    species_inactive_q = inactive_q | ~Q(
+        schema_version=SpeciesImportEvent.import_schema_version)
+
+    if table_name == TABLE_ACTIVE_TREES:
+        title = _('Active Tree Imports')
+        rows = trees.exclude(trees_inactive_q)
+
+    elif table_name == TABLE_FINISHED_TREES:
+        title = _('Finished Tree Imports')
+        rows = trees.filter(trees_inactive_q)
+
+    elif table_name == TABLE_ACTIVE_SPECIES:
+        title = _('Active Species Imports')
+        rows = species.exclude(species_inactive_q)
+
+    elif table_name == TABLE_FINISHED_SPECIES:
+        title = _('Finished Species Imports')
+        rows = species.filter(species_inactive_q)
+
+    else:
+        raise Exception('Unexpected import table name: %s' % table_name)
+
+    # Get has_pending before filtering by page so that completing an
+    # import on a non-visible page will still trigger a refresh of the
+    # finished table
+    has_pending = any(not ie.is_finished() for ie in rows)
+
+    paginator = Paginator(rows, _EVENT_TABLE_PAGE_SIZE)
+    rows = paginator.page(min(page_number, paginator.num_pages))
+
+    paging_url = reverse('importer:get_import_table',
+                         args=(instance.url_name, table_name))
+    refresh_url = paging_url + '?page=%s' % page_number
+
+    return {
+        'name': table_name,
+        'title': title,
+        'page_size': _EVENT_TABLE_PAGE_SIZE,
+        'rows': rows,
+        'has_pending': has_pending,
+        'paging_url': paging_url,
+        'refresh_url': refresh_url,
+    }
 
 
 @transaction.atomic
@@ -122,8 +214,8 @@ def merge_species(request, instance):
             status=400)
 
     # TODO: .update_with_user()?
-    trees_to_update = Tree.objects\
-        .filter(instance=instance)\
+    trees_to_update = Tree.objects \
+        .filter(instance=instance) \
         .filter(species=species_to_delete)
 
     for tree in trees_to_update:
@@ -154,6 +246,21 @@ def update_row(request, instance, import_type, row_id):
 
     basedata = row.datadict
 
+    # Minor workaround for updating species columns in tree imports
+    # The client sends up a species_id field, which does not match any of the
+    # columns in the ImportRow. If it is present, we look up the species in the
+    # DB and fill in the appropriate species fields in the ImportRow
+    if 'species_id' in request.POST:
+        # this round tripped from the server, so it should always have a match.
+        species = Species.objects.get(pk=request.POST['species_id'])
+        basedata.update({
+            fields.trees.GENUS: species.genus,
+            fields.trees.SPECIES: species.species,
+            fields.trees.CULTIVAR: species.cultivar,
+            fields.trees.OTHER_PART_OF_NAME: species.other_part_of_name,
+            fields.trees.COMMON_NAME: species.common_name
+        })
+
     for k, v in request.POST.iteritems():
         if k in basedata:
             basedata[k] = v
@@ -170,7 +277,6 @@ def update_row(request, instance, import_type, row_id):
     panel_name = request.GET.get('panel', 'verified')
     page_number = int(request.GET.get('page', '1'))
     context = _get_status_panels(ie, instance, panel_name, page_number)
-    context['active_panel_name'] = 'error'
     return context
 
 
@@ -179,7 +285,8 @@ def show_import_status(request, instance, import_type, import_event_id):
 
     if ie.status == GenericImportEvent.FAILED_FILE_VERIFICATION:
         template = 'importer/partials/file_status.html'
-        legal_fields, required_fields = ie.legal_and_required_fields()
+        legal_fields, required_fields = \
+            ie.legal_and_required_fields_title_case()
         ctx = {'ie': ie,
                'legal_fields': sorted(legal_fields),
                'required_fields': sorted(required_fields),
@@ -196,23 +303,22 @@ def show_import_status(request, instance, import_type, import_event_id):
 
 
 def _get_tree_limit_context(ie):
-
     if ie.import_type == 'species':
         return {}
 
-    tier_tree_limit = get_tree_limit(ie.instance)
+    tree_limit = get_tree_limit(ie.instance)
 
-    if tier_tree_limit is None:
+    if tree_limit is None:
         return {}
 
     tree_count = MapFeature.objects.filter(instance=ie.instance).count()
-    remaining_tree_limit = tier_tree_limit - tree_count
+    remaining_tree_limit = tree_limit - tree_count
     verified_count = ie.rows().filter(status=TreeImportRow.VERIFIED).count()
 
     tree_limit_exceeded = remaining_tree_limit - verified_count < 0
 
     return {
-        'tier_tree_limit': tier_tree_limit,
+        'tree_limit': tree_limit,
         'tree_count': tree_count,
         'remaining_tree_limit': remaining_tree_limit,
         'tree_limit_exceeded': tree_limit_exceeded,
@@ -272,9 +378,9 @@ def _get_status_panel(instance, ie, panel_spec, page_number=1):
     if is_species and status == GenericImportRow.VERIFIED:
         query = query.filter(merged=True)
 
-    field_names = [f.lower() for f
-                   in json.loads(ie.field_order)
-                   if f != 'ignore']
+    field_names_original = [f.strip() for f in json.loads(ie.field_order)
+                            if f != 'ignore']
+    field_names = [f.lower() for f in field_names_original]
 
     class RowPage(Page):
         def __getitem__(self, *args, **kwargs):
@@ -287,23 +393,31 @@ def _get_status_panel(instance, ie, panel_spec, page_number=1):
             return RowPage(*args, **kwargs)
 
     row_pages = RowPaginator(query, PAGE_SIZE)
-    row_page = row_pages.page(page_number)
+
+    try:
+        row_page = row_pages.page(page_number)
+    except EmptyPage:
+        # If the page number is out of bounds, return the last page
+        row_page = row_pages.page(row_pages.num_pages)
 
     paging_url = reverse('importer:status',
                          kwargs={'instance_url_name': instance.url_name,
                                  'import_type': ie.import_type,
                                  'import_event_id': ie.pk})
-    paging_url += "?panel=%s" % panel_spec['name']
+    panel_query = "?panel=%s" % panel_spec['name']
+    paging_url += panel_query
+    panel_and_page = panel_query + "&page=%s" % page_number
 
     return {
         'name': panel_spec['name'],
         'title': panel_spec['title'],
-        'field_names': field_names,
+        'field_names': field_names_original,
         'row_count': row_pages.count,
         'rows': row_page,
         'paging_url': paging_url,
         'import_event_id': ie.pk,
-        'import_type': ie.import_type
+        'import_type': ie.import_type,
+        'panel_and_page': panel_and_page
     }
 
 
@@ -461,7 +575,7 @@ def _get_merge_data(row, field_names, row_errors):
         'fields_to_merge': fields_to_merge,
         'merge_field_names': ','.join(merge_names),
         'radio_group_names': ','.join(dom_names),
-        }
+    }
 
 
 def _get_diff_value(dom_name, i, value):
@@ -544,7 +658,7 @@ def solve(request, instance, import_event_id, row_index):
     target_species = request.GET['species']
 
     # Strip off merge errors
-    #TODO: Json handling is terrible.
+    # TODO: Json handling is terrible.
     row.errors = json.dumps(row.errors_array_without_merge_errors())
     row.datadict.update(data)
     row.datadict = row.datadict  # invoke setter to update row.data
@@ -562,17 +676,17 @@ def solve(request, instance, import_event_id, row_index):
     return context
 
 
-@transaction.atomic
 def commit(request, instance, import_type, import_event_id):
-    ie = _get_import_event(instance, import_type, import_event_id)
+    with transaction.atomic():
+        ie = _get_import_event(instance, import_type, import_event_id)
 
-    if _get_tree_limit_context(ie).get('tree_limit_exceeded'):
-        raise Exception(_("tree limit exceeded"))
+        if _get_tree_limit_context(ie).get('tree_limit_exceeded'):
+            raise Exception(_("tree limit exceeded"))
 
-    ie.status = GenericImportEvent.CREATING
+        ie.status = GenericImportEvent.CREATING
 
-    ie.save()
-    ie.rows().update(status=GenericImportRow.WAITING)
+        ie.update_progress_timestamp_and_save()
+        ie.rows().update(status=GenericImportRow.WAITING)
 
     commit_import_event.delay(import_type, import_event_id)
 
@@ -584,9 +698,7 @@ def process_csv(request, instance, import_type, **kwargs):
     filename = files.keys()[0]
     file_obj = files[filename]
 
-    file_obj = io.BytesIO(file_obj.read()
-                          .decode('latin1')
-                          .encode('utf-8'))
+    file_obj = io.BytesIO(decode(file_obj.read()).encode('utf-8'))
 
     owner = request.user
     ImportEventModel = get_import_event_model(import_type)
@@ -601,24 +713,39 @@ def process_csv(request, instance, import_type, **kwargs):
     return ie.pk
 
 
+# http://stackoverflow.com/a/8898439/362702
+def decode(s):
+    for encoding in "utf-8-sig", "utf-16":
+        try:
+            return s.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return s.decode("latin-1")
+
+
 @transaction.atomic
 def cancel(request, instance, import_type, import_event_id):
     ie = _get_import_event(instance, import_type, import_event_id)
 
     ie.status = GenericImportEvent.CANCELED
-    ie.save()
+    ie.mark_finished_and_save()
 
     # If verifications tasks are still scheduled, we need to revoke them
     if ie.task_id:
-        GroupResult(ie.task_id).revoke()
+        result = GroupResult.restore(ie.task_id)
+        if result:
+            result.revoke()
+
+    # If we couldn't get the task, it is already effectively cancelled
 
     return list_imports(request, instance)
 
 
-@task_output_as_csv
+@queryset_as_exported_csv
 def export_all_species(request, instance):
-    return ("all_species.csv", get_all_species_export, (instance.pk,),
-            fields.species.ALL)
+    field_names = SpeciesImportRow.SPECIES_MAP.keys()
+    field_names.remove('id')
+    return Species.objects.filter(instance_id=instance.id).values(*field_names)
 
 
 @task_output_as_csv
@@ -626,8 +753,27 @@ def export_single_import(request, instance, import_type, import_event_id):
     ie = _get_import_event(instance, import_type, import_event_id)
 
     if import_type == SpeciesImportEvent.import_type:
-        filename, csv_fields = "species.csv", fields.species.ALL
+        filename = "species.csv"
+        field_names = fields.species.ALL
     else:
-        filename, csv_fields = "trees.csv", ie.ordered_legal_fields()
+        filename = "trees.csv"
+        field_names = ie.ordered_legal_fields()  # TODO: use ie's saved fields
 
-    return filename, get_import_export, (import_type, ie.pk,), csv_fields
+    return filename, get_import_export, (import_type, ie.pk,), field_names
+
+
+def download_import_template(request, instance, import_type):
+    if import_type == SpeciesImportEvent.import_type:
+        filename = 'OpenTreeMap_Species_Import_Template.csv'
+        field_names = fields.title_case(fields.species.ALL)
+    else:
+        filename = 'OpenTreeMap_Tree_Import_Template.csv'
+        ie = TreeImportEvent(instance=instance)
+        field_names = ie.ordered_legal_fields_title_case()
+
+    response = HttpResponse(content_type="text/csv")
+    response["Content-Disposition"] = "attachment; filename=%s" % filename
+    writer = csv.DictWriter(response, field_names)
+    writer.writeheader()
+
+    return response

@@ -5,14 +5,17 @@ var $ = require('jquery'),
     L = require('leaflet'),
     toastr = require('toastr'),
     otmTypeahead = require('treemap/otmTypeahead'),
-    plotMover = require('treemap/plotMover'),
+    geometryMover = require('treemap/geometryMover'),
     diameterCalculator = require('treemap/diameterCalculator'),
     reverseGeocodeStreamAndUpdateAddressesOnForm =
         require('treemap/reverseGeocodeStreamAndUpdateAddressesOnForm');
 
+var dom = {
+    form: '#details-form',
+    ecoBenefits: '.benefit-values'
+};
 
-var formSelector = '#details-form',
-    mapManager,
+var mapManager,
     inlineEditForm,
     typeaheads,
     plotMarker,
@@ -25,9 +28,13 @@ function init(options) {
     typeaheads = options.typeaheads;
     plotMarker = options.plotMarker;
 
+    inlineEditForm.inEditModeProperty.onValue(function (inEditMode) {
+        $(dom.ecoBenefits).toggle(!inEditMode);
+    });
+
     var markerMoveStream = plotMarker.moveStream.filter(options.inMyMode);
     reverseGeocodeStreamAndUpdateAddressesOnForm(
-        options.config, markerMoveStream, formSelector);
+        options.config, markerMoveStream, dom.form);
 }
 
 function onClick(e) { 
@@ -41,17 +48,17 @@ function onClick(e) {
 function activate() {
     otmTypeahead.bulkCreate(typeaheads);
 
-    currentPlotMover = plotMover.init({
+    currentPlotMover = geometryMover.plotMover({
         mapManager: mapManager,
         plotMarker: plotMarker,
         inlineEditForm: inlineEditForm,
         editLocationButton: '#edit-plot-location',
         cancelEditLocationButton: '#cancel-edit-plot-location',
-        location: plotMarker.getLocation()
+        location: {point: plotMarker.getLocation()}
     });
 
     calculator = diameterCalculator({
-        formSelector: formSelector,
+        formSelector: dom.form,
         cancelStream: inlineEditForm.cancelStream,
         saveOkStream: inlineEditForm.saveOkStream
     });

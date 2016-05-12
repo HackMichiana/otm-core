@@ -39,7 +39,7 @@ from treemap.views.map_feature import (update_map_feature, delete_map_feature,
                                        rotate_map_feature_photo, plot_detail)
 from treemap.views.user import (user_audits, upload_user_photo, update_user,
                                 forgot_username, user)
-from treemap.views.photo import approve_or_reject_photo
+from treemap.views.photo import approve_or_reject_photos
 from treemap.views.tree import delete_tree
 from treemap.tests import (ViewTestCase, make_instance, make_officer_user,
                            make_commander_user, make_apprentice_user,
@@ -231,12 +231,15 @@ class TreePhotoRotationTest(TreePhotoTestCase):
         self.assertEqual(1, len(context['photos']))
         self.assertEqual(old_photo.pk, context['photos'][0]['id'])
 
-        self.assertEqual(
-            (old_photo.image.width, old_photo.image.height),
-            (rotated_photo.image.height, rotated_photo.image.width))
-        self.assertEqual(
-            (old_photo.thumbnail.width, old_photo.thumbnail.height),
-            (rotated_photo.thumbnail.height, rotated_photo.thumbnail.width))
+        self.assertAlmostEqual(old_photo.image.width,
+                               rotated_photo.image.height, delta=1)
+        self.assertAlmostEqual(old_photo.image.height,
+                               rotated_photo.image.width, delta=1)
+
+        self.assertAlmostEqual(old_photo.thumbnail.width,
+                               rotated_photo.thumbnail.height, delta=1),
+        self.assertAlmostEqual(old_photo.thumbnail.height,
+                               rotated_photo.thumbnail.width, delta=1)
 
 
 class ApproveOrRejectPhotoTest(TreePhotoTestCase):
@@ -250,9 +253,29 @@ class ApproveOrRejectPhotoTest(TreePhotoTestCase):
         tp = TreePhoto.objects.all()[0]
         all_audits = list(tp.audits())
 
-        approve_or_reject_photo(
-            make_request(user=self.user),
-            self.instance, self.plot.pk, tp.pk, 'approve')
+        approve_or_reject_photos(
+            make_request({'ids': str(tp.pk)}, user=self.user),
+            self.instance, 'approve')
+
+        for audit in all_audits:
+            audit = Audit.objects.get(pk=audit.pk)
+            self.assertEqual(audit.ref.action, Audit.Type.ReviewApprove)
+
+    @media_dir
+    def test_approve_multiple_photos(self):
+        self.assertEqual(TreePhoto.objects.count(), 0)
+
+        self.tree.add_photo(self.image, self.user)
+
+        self.tree.add_photo(self.image, self.user)
+
+        tp_ids = ','.join(str(tp.pk) for tp in TreePhoto.objects.all())
+        all_audits = list(audit for tp in TreePhoto.objects.all()
+                          for audit in tp.audits())
+
+        approve_or_reject_photos(
+            make_request({'ids': tp_ids}, user=self.user),
+            self.instance, 'approve')
 
         for audit in all_audits:
             audit = Audit.objects.get(pk=audit.pk)
@@ -269,9 +292,9 @@ class ApproveOrRejectPhotoTest(TreePhotoTestCase):
         tp = TreePhoto.objects.all()[0]
         audit_list = list(tp.audits())
 
-        approve_or_reject_photo(
-            make_request(user=self.user),
-            self.instance, self.plot.pk, tp.pk, 'reject')
+        approve_or_reject_photos(
+            make_request({'ids': str(tp.pk)}, user=self.user),
+            self.instance, 'reject')
 
         for audit in audit_list:
             audit = Audit.objects.get(pk=audit.pk)
@@ -299,9 +322,9 @@ class ApproveOrRejectPhotoTest(TreePhotoTestCase):
 
         tp_pk = tp_audit.current_value
 
-        approve_or_reject_photo(
-            make_request(user=self.user),
-            self.instance, self.plot.pk, tp_pk, 'approve')
+        approve_or_reject_photos(
+            make_request({'ids': str(tp_pk)}, user=self.user),
+            self.instance, 'approve')
 
         tp = TreePhoto.objects.get(pk=tp_pk)
         for audit in tp.audits():
@@ -332,9 +355,9 @@ class ApproveOrRejectPhotoTest(TreePhotoTestCase):
 
         tp_pk = tp_audit.current_value
 
-        approve_or_reject_photo(
-            make_request(user=self.user),
-            self.instance, self.plot.pk, tp_pk, 'reject')
+        approve_or_reject_photos(
+            make_request({'ids': str(tp_pk)}, user=self.user),
+            self.instance, 'reject')
 
         audit_list = Audit.objects.filter(
             model='TreePhoto', field='id', model_id=tp_pk)
@@ -1754,10 +1777,9 @@ class DeleteViewTests(ViewTestCase):
         Tree(plot=plot, instance=self.instance,
              diameter=10).save_with_user(self.user)
 
-        raw_response = delete_map_feature(self.request, self.instance, plot.pk)
+        with self.assertRaises(ValidationError):
+            delete_map_feature(self.request, self.instance, plot.pk)
 
-        self.assertEqual(raw_response,
-                         "Cannot delete plot with existing trees.")
         self.assertEqual(Plot.objects.count(), 1)
 
     def test_delete_plot_view_success(self):

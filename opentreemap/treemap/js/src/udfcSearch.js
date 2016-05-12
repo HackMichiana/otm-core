@@ -2,10 +2,10 @@
 
 var $ = require('jquery'),
     Bacon = require('baconjs'),
+    R = require('ramda'),
     _ = require('lodash'),
     format = require('util').format,
     M = require('treemap/BaconModels'),
-    juxt = require('treemap/utility').juxt,
     moment = require('moment'),
     getOptionAttr = M.getOptionAttr,
     getVal = M.getVal,
@@ -27,11 +27,10 @@ var nameTemplate = _.template('udf:<%= modelName %>:<%= udfFieldDefId %>.<%= fie
         },
         type: {
             selector: '#udfc-search-type',
-            reset: _.partial(resetSelectWidget, 'type', 'data-type'),
+            reset: _.partial(resetType, 'type', 'data-type'),
             stateModifiers: {
                 type: getOptionAttr('data-type'),
-                plotUdfFieldDefId: getOptionAttr('data-plot-udfd-id'),
-                treeUdfFieldDefId: getOptionAttr('data-tree-udfd-id'),
+                udfFieldDefIds: getOptionAttr('data-udfd-ids'),
                 actionFieldKey: getOptionAttr('data-action-field-key'),
                 dateFieldKey: getOptionAttr('data-date-field-key'),
                 action: null
@@ -67,23 +66,26 @@ var nameTemplate = _.template('udf:<%= modelName %>:<%= udfFieldDefId %>.<%= fie
         .value();
 
 function makeNameAttribute (state, fieldKey) {
-
     var modelName = state.modelName,
-        udfFieldDefId = state[state.modelName + 'UdfFieldDefId'],
         requiredFields = [modelName,
-                          state.plotUdfFieldDefId,
-                          state.treeUdfFieldDefId,
                           state.actionFieldKey,
                           state.dateFieldKey,
-                          udfFieldDefId],
-        validators = [_.isUndefined, _.isNull],
-        isInvalid = function (val) { return _.any(_.flatten(juxt(validators)(val))); },
-        nameAttribute = _.any(requiredFields, isInvalid) ? '' :
-            nameTemplate({modelName: modelName,
-                          udfFieldDefId: udfFieldDefId,
-                          fieldKey: fieldKey});
+                          state.udfFieldDefIds],
+        udfFieldDefId;
 
-    return nameAttribute;
+    if (_.any(requiredFields, R.or(_.isUndefined, _.isNull))) {
+        return '';
+    }
+
+    udfFieldDefId = JSON.parse(state.udfFieldDefIds)[modelName];
+
+    if (_.isUndefined(udfFieldDefId)) {
+        return '';
+    }
+
+    return nameTemplate({modelName: modelName,
+                      udfFieldDefId: udfFieldDefId,
+                      fieldKey: fieldKey});
 }
 
 
@@ -91,6 +93,7 @@ function resetSelectWidget(widgetName, optionKey, state) {
     var stateVal = state[widgetName],
         $option,
         val;
+
     if (!_.isNull(stateVal)) {
         $option = $(widgets[widgetName].selector)
             .find('option')
@@ -102,10 +105,22 @@ function resetSelectWidget(widgetName, optionKey, state) {
     $(widgets[widgetName].selector).val(val);
 }
 
+function resetType(widgetName, optionKey, state) {
+    resetSelectWidget(widgetName, optionKey, state);
+    var $el = $(widgets.type.selector),
+        shouldEnable = !_.isNull(state.modelName);
+    enableInput($el, shouldEnable);
+}
+
+function enableInput($el, shouldEnable) {
+    $el.prop('disabled', shouldEnable ? false : 'disabled');
+}
+
 function resetAction(state) {
     var $el = $(widgets.action.selector),
         $currentOptions = $el.find('option').not('[data-class="udfc-placeholder"]'),
         $allOptions = $el.data('options'),
+        shouldEnable = !_.isNull(state.modelName) && !_.isNull(state.type),
         modelSelector,
         typeSelector;
 
@@ -117,7 +132,7 @@ function resetAction(state) {
     }
 
     $currentOptions.remove();
-    if (!_.isNull(state.modelName) && !_.isNull(state.type)) {
+    if (shouldEnable) {
         modelSelector = format('[data-model="%s"]', state.modelName);
         typeSelector = format('[data-type="%s"]', state.type);
 
@@ -127,6 +142,7 @@ function resetAction(state) {
             .filter(typeSelector)
             .appendTo($el);
     }
+    enableInput($el, shouldEnable);
 
     $el = $(widgets.action.selector);
     if (!_.isNull(state.action)) {
@@ -135,7 +151,6 @@ function resetAction(state) {
         $el.val('');
     }
     $el.attr('name', makeNameAttribute(state, state.actionFieldKey));
-
 }
 
 function resetDateBox(widgetName, state) {
@@ -143,15 +158,19 @@ function resetDateBox(widgetName, state) {
         $widget = $(widgets[widgetName].selector),
         longDate = moment(state[widgetName], DATETIME_FORMAT),
         shortDate = moment(state[widgetName], 'MM/DD/YYYY'),
+        shouldEnable = !_.isNull(state.modelName) && !_.isNull(state.type),
         val;
 
-    if (!_.isNull(longDate) && longDate.isValid()) {
-        val = longDate.format('MM/DD/YYYY');
-    } else if (!_.isNull(shortDate) && shortDate.isValid()) {
-        val = shortDate.format('MM/DD/YYYY');
-    } else {
-        val = '';
+    if (shouldEnable) {
+        if (!_.isNull(longDate) && longDate.isValid()) {
+            val = longDate.format('MM/DD/YYYY');
+        } else if (!_.isNull(shortDate) && shortDate.isValid()) {
+            val = shortDate.format('MM/DD/YYYY');
+        } else {
+            val = '';
+        }
     }
+    enableInput($widget, shouldEnable);
 
     $widget.attr('name', name);
     $widget.val(val);
@@ -210,11 +229,13 @@ function applyFilterObjectToDom(bus, filterObject) {
     state.modelName = cleanModelName;
 
     var $typeEl = $(widgets.type.selector)
-        .find('option')
-        .filter('[data-' + cleanModelName + '-udfd-id="' + udfFieldDefId + '"]');
+            .find('option[data-udfd-ids]')
+            .filter(function (__, el) {
+                var id = JSON.parse($(el).attr('data-udfd-ids'))[cleanModelName];
+                return id == udfFieldDefId;
+            });
 
-    state.treeUdfFieldDefId = $typeEl.attr('data-tree-udfd-id');
-    state.plotUdfFieldDefId = $typeEl.attr('data-plot-udfd-id');
+    state.udfFieldDefIds = $typeEl.attr('data-udfd-ids');
     state.dateFieldKey = $typeEl.attr('data-date-field-key');
     state.actionFieldKey = $typeEl.attr('data-action-field-key');
     state.type = $typeEl.attr('data-type');
